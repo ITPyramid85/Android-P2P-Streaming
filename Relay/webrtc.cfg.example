@@ -1,0 +1,11 @@
+# Copied to webrtc.cfg next to rc-relay.exe. Both peers receive this list
+# inside pair_ok and use it for ICE. The relay itself never carries video.
+#
+# STUN discovers the public address so the peers can connect directly.
+stun=stun:stun.l.google.com:19302
+
+# TURN (coturn) is the fallback when both sides are behind symmetric NAT.
+# Leave these commented until a TURN server is running. See turnserver.conf.example.
+# turn=turn:167.114.172.44:3478
+# turn_user=rc
+# turn_pass=change-me

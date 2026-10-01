@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemoteApp</string>
+    <string name="subtitle">Connects to the server in the background and starts screen capture.</string>
+
+    <string name="network_section">Server connection</string>
+    <string name="network_status_idle">Not connected — enter the server address and tap Connect.</string>
+    <string name="network_host_hint">Server IP</string>
+    <string name="network_port_hint">Port</string>
+    <string name="network_connect">Connect</string>
+    <string name="network_disconnect">Disconnect</string>
+    <string name="network_notification_title">Server connection</string>
+    <string name="network_channel_name">Server connection</string>
+    <string name="network_channel_desc">Keeps the connection to the control server.</string>
+    <string name="network_need_projection">The server requested screen monitoring. Please grant screen capture permission.</string>
+    <string name="network_invalid_port">Invalid port.</string>
+
+    <string name="screen_section">Screen capture</string>
+    <string name="status_idle">Idle — tap Start to begin screen capture (50ms, upload to server).</string>
+    <string name="status_capturing">Capturing and uploading the screen every 50ms…</string>
+    <string name="status_stopped">Screen capture stopped.</string>
+    <string name="status_saved">Saved frame %1$d: %2$s</string>
+    <string name="status_streamed">Uploaded frame %1$d</string>
+    <string name="status_error">Error: %1$s</string>
+    <string name="frames_saved">Frames processed: %1$d</string>
+    <string name="output_path">Output: live upload to server (not saved to Downloads)</string>
+    <string name="output_path_dynamic">Output: %1$s</string>
+    <string name="start_capture">Start capture</string>
+    <string name="stop_capture">Stop capture</string>
+    <string name="permission_denied">Screen capture permission denied.</string>
+    <string name="notification_channel_name">Screen capture</string>
+    <string name="notification_channel_desc">Shows screen capture progress.</string>
+    <string name="notification_capturing">Capturing… uploaded %1$d frames</string>
+</resources>

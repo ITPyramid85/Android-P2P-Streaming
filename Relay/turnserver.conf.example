@@ -1,0 +1,16 @@
+# Example coturn config. Run coturn on the same host as the relay, then
+# uncomment the turn= lines in webrtc.cfg. UDP 3478 must be reachable.
+#
+#   turnserver -c turnserver.conf
+#
+listening-port=3478
+fingerprint
+lt-cred-mech
+user=rc:change-me
+realm=remoteapp
+no-cli
+# Allow the peer to relay media only after the long-term credential matches.
+# Open UDP 3478 (and the relay port range) on the firewall. TCP 9000 stays
+# the signaling port used by rc-relay.exe.
+min-port=49160
+max-port=49200

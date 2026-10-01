@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemoteApp</string>
+    <string name="network_disconnect">断开</string>
+    <string name="network_notification_title">服务器连接</string>
+    <string name="network_channel_name">服务器连接</string>
+    <string name="network_channel_desc">保持与控制服务器的连接。</string>
+    <string name="stop_capture">停止截屏</string>
+    <string name="notification_channel_name">屏幕截取</string>
+    <string name="notification_channel_desc">显示屏幕截取进度。</string>
+    <string name="notification_capturing">正在截取… 已上传 %1$d 帧</string>
+    <string name="device_name_title">Device name</string>
+    <string name="device_name_message">Enter a name for this device. It will appear in the desktop app device list.</string>
+    <string name="device_name_hint">Device name</string>
+    <string name="consent_channel_name">屏幕共享授权</string>
+    <string name="consent_notification_title">屏幕共享授权</string>
+    <string name="consent_notification_text">点击允许屏幕共享。</string>
+    <string name="accessibility_service_label">InputAccessibility</string>
+    <string name="accessibility_desc">Allows the desktop to tap, swipe, and press keys on this phone when USB debugging is off.</string>
+</resources>

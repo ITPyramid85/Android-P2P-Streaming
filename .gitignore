@@ -1,0 +1,53 @@
+# Build output
+build/
+build-*/
+**/build/
+**/build-*/
+cmake-build-*/
+_deps/
+CMakeUserPresets.json
+*.user
+
+# Android / Gradle
+.gradle/
+.kotlin/
+.cxx/
+local.properties
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.iml
+build_out.txt
+
+# Compiled binaries and archives
+*.exe
+*.zip
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# FFmpeg: only the libraries the desktop app links are vendored
+Server/third_party/ffmpeg/bin/*
+!Server/third_party/ffmpeg/bin/avcodec-*.dll
+!Server/third_party/ffmpeg/bin/avutil-*.dll
+!Server/third_party/ffmpeg/bin/swscale-*.dll
+!Server/third_party/ffmpeg/bin/swresample-*.dll
+
+# Local runtime config (see *.example)
+Relay/webrtc.cfg
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE / OS
+.idea/
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
