@@ -5,6 +5,7 @@
 
 #include <QMainWindow>
 #include <QHash>
+#include <QSet>
 
 class QTableWidget;
 class QTextEdit;
@@ -46,4 +47,7 @@ private:
     QTextEdit *m_log = nullptr;
     TcpServer *m_server = nullptr;
     QHash<QString, int> m_rowByClientId;
+    // Mobiles whose preview window is open. They stay in the table's model so a
+    // re-registration still updates them, but their row is hidden.
+    QSet<QString> m_monitoredIds;
 };

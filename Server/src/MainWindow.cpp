@@ -326,17 +326,34 @@ int MainWindow::findRowByPhone(const QString &phone) const
 void MainWindow::rebuildRowIndex()
 {
     m_rowByClientId.clear();
+    bool hidSelection = false;
+    int visible = 0;
     for (int row = 0; row < m_table->rowCount(); ++row) {
         QTableWidgetItem *item = m_table->item(row, kColNo);
         if (!item) {
             continue;
         }
-        item->setText(QString::number(row + 1));
-        item->setTextAlignment(Qt::AlignCenter);
         const QString id = item->data(Qt::UserRole).toString();
+        // A mobile being previewed is driven from its own window, so it drops out
+        // of the list until that window closes. The row keeps its data and stays
+        // indexed, so a re-registration while hidden still lands on it.
+        const bool monitored = !id.isEmpty() && m_monitoredIds.contains(id);
+        m_table->setRowHidden(row, monitored);
+        if (monitored) {
+            hidSelection = hidSelection || m_table->selectionModel()->isRowSelected(row);
+        } else {
+            // Number the rows on show, not on position, so hiding one does not
+            // leave a gap in the column.
+            item->setText(QString::number(++visible));
+            item->setTextAlignment(Qt::AlignCenter);
+        }
         if (!id.isEmpty()) {
             m_rowByClientId.insert(id, row);
         }
+    }
+    // Hiding a row leaves it selected, and the context menu acts on the selection.
+    if (hidSelection) {
+        m_table->selectionModel()->clearSelection();
     }
 }
 
@@ -412,6 +429,14 @@ void MainWindow::openScreenMonitoring()
         return m_server->attachAgent(id);
     };
     dialog->setAttribute(Qt::WA_DeleteOnClose);
+    // Track by id rather than by scanning for live dialogs: destroyed() fires once
+    // the ScreenMonitorDialog part is already gone, so agentId() is unreachable.
+    connect(dialog, &QObject::destroyed, this, [this, id]() {
+        m_monitoredIds.remove(id);
+        rebuildRowIndex();
+    });
+    m_monitoredIds.insert(id);
+    rebuildRowIndex();
     dialog->show();
 }
 
