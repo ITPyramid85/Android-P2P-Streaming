@@ -8,12 +8,13 @@
 #include <QWidget>
 #include <functional>
 
+class QEvent;
 class QKeyEvent;
 
 class ScreenInputView : public QWidget
 {
 public:
-    enum class Kind { Press, Move, Release, Wheel, Key, KeyRelease };
+    enum class Kind { Press, Move, Release, Wheel, Key, KeyRelease, Leave };
 
     struct Event {
         Kind kind;
@@ -43,6 +44,7 @@ protected:
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;

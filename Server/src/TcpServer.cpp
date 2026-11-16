@@ -17,6 +17,7 @@
 #include <QTcpSocket>
 #include <QThread>
 #include <QTimer>
+#include <QSysInfo>
 #include <QUuid>
 #include <QtEndian>
 
@@ -38,6 +39,20 @@ TcpServer::TcpServer(QObject *parent)
             &TcpServer::onControlError);
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &TcpServer::onReconnectTimer);
+    m_heartbeatTimer = new QTimer(this);
+    m_heartbeatTimer->setInterval(4000);
+    connect(m_heartbeatTimer, &QTimer::timeout, this, &TcpServer::onHeartbeatTimer);
+}
+
+void TcpServer::onHeartbeatTimer()
+{
+    if (!m_control || m_control->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    QJsonObject ping;
+    ping.insert(QStringLiteral("type"), QStringLiteral("ping"));
+    m_control->write(Packet::encodeControlJson(ping));
+    m_control->flush();
 }
 
 TcpServer::~TcpServer()
@@ -151,6 +166,120 @@ bool TcpServer::isAgentOnline(const QString &agentId) const
     return m_agents.contains(agentId);
 }
 
+void TcpServer::requestAgentClaim(const QString &agentId)
+{
+    const QString id = agentId.trimmed();
+    if (id.isEmpty()) {
+        return;
+    }
+    if (!m_control || m_control->state() != QAbstractSocket::ConnectedState) {
+        emit agentClaimDenied(id, QStringLiteral("offline"));
+        return;
+    }
+    writeClaim(id, true);
+}
+
+void TcpServer::releaseAgentClaim(const QString &agentId, bool endShare)
+{
+    const QString id = agentId.trimmed();
+    if (id.isEmpty()) {
+        return;
+    }
+    m_claimed.remove(id);
+    m_controlKeys.remove(id);
+    // Tell the relay first. It is the only party that can revoke this controller
+    // for everyone at once, and it stops the phone's capture and its input the
+    // moment it reads this line. Nothing below may be allowed to delay that:
+    // detaching first made the phone's teardown wait on our socket cleanup.
+    writeClaim(id, false, endShare);
+    if (ClientHandler *handler = handlerForId(id)) {
+        // The stop this window just queued is worth a few milliseconds — it is the
+        // fastest path to the phone, going out over the direct UDP punch. Then cut
+        // the handler off so nothing else can follow it.
+        handler->waitForOutputDrain(150);
+        handler->revokeControl();
+    }
+    detachAgent(id);
+}
+
+void TcpServer::dropLocalEnded(const QString &agentId)
+{
+    const QString id = agentId.trimmed();
+    if (id.isEmpty()) {
+        return;
+    }
+    const quint32 epoch = m_listEpoch.value(id, 0);
+    if (epoch != 0) {
+        const quint32 prev = m_endedEpoch.value(id, 0);
+        if (epoch > prev) {
+            m_endedEpoch.insert(id, epoch);
+        }
+    }
+    m_claimed.remove(id);
+    m_controlKeys.remove(id);
+    ClientHandler *handler = nullptr;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        m_agents.remove(id);
+        handler = m_handlers.take(id);
+    }
+    if (handler) {
+        closeHandler(handler, false);
+    }
+    emit clientRemoved(id);
+}
+
+void TcpServer::expireAgentSession(const QString &agentId)
+{
+    const QString id = agentId.trimmed();
+    if (id.isEmpty()) {
+        return;
+    }
+    m_claimed.remove(id);
+    m_controlKeys.remove(id);
+    if (m_control && m_control->state() == QAbstractSocket::ConnectedState) {
+        QJsonObject msg;
+        msg.insert(QStringLiteral("type"), QStringLiteral("expire"));
+        msg.insert(QStringLiteral("agentId"), id);
+        m_control->write(Packet::encodeControlJson(msg));
+        m_control->flush();
+    }
+    if (ClientHandler *handler = handlerForId(id)) {
+        handler->waitForOutputDrain(150);
+        handler->revokeControl();
+    }
+    detachAgent(id);
+}
+
+void TcpServer::detachAgent(const QString &agentId)
+{
+    ClientHandler *handler = nullptr;
+    {
+        QMutexLocker lock(&m_sessionMutex);
+        handler = m_handlers.take(agentId);
+        m_attaching.remove(agentId);
+    }
+    if (handler) {
+        closeHandler(handler, false);
+    }
+}
+
+void TcpServer::writeClaim(const QString &agentId, bool claimed, bool endShare)
+{
+    if (!m_control || m_control->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+    QJsonObject msg;
+    msg.insert(QStringLiteral("type"),
+               claimed ? QStringLiteral("claim") : QStringLiteral("release"));
+    msg.insert(QStringLiteral("agentId"), agentId);
+    if (!claimed && endShare) {
+        msg.insert(QStringLiteral("endShare"), true);
+    }
+    m_control->write(Packet::encodeControlJson(msg));
+    m_control->flush();
+}
+
 ClientHandler *TcpServer::attachAgent(const QString &agentId)
 {
     if (agentId.isEmpty()) {
@@ -245,6 +374,7 @@ void TcpServer::connectToRelay()
 
 void TcpServer::onControlConnected()
 {
+    m_listEpoch.clear();
     m_port = m_relayPort;
     emit logMessage(QStringLiteral("Launch at %1").arg(formatTimestamp()), true);
     emit logMessage(QStringLiteral("Relay : %1:%2")
@@ -263,13 +393,32 @@ void TcpServer::sendDesktopHello()
     hello.insert(QStringLiteral("type"), QStringLiteral("hello"));
     hello.insert(QStringLiteral("role"), QStringLiteral("desktop"));
     hello.insert(QStringLiteral("desktopId"), m_desktopId);
+    // Identity the phone shows on its "Connected to you" card.
+    const QString host = QSysInfo::machineHostName().trimmed();
+    hello.insert(QStringLiteral("name"),
+                 host.isEmpty() ? QStringLiteral("Support controller") : host);
+    hello.insert(QStringLiteral("detail"),
+                 QStringLiteral("%1 • MenuOnline").arg(m_desktopId.left(8)));
+    hello.insert(QStringLiteral("device"),
+                 QStringLiteral("%1 • MenuOnline")
+                     .arg(QSysInfo::prettyProductName()));
     m_control->write(Packet::encodeControlJson(hello));
     m_control->flush();
+    m_heartbeatTimer->start();
+    // Re-ask for any preview that is still open here. The relay treats a losing
+    // controller as gone for good, so this is expected to come back denied and the
+    // window will close itself; it only succeeds when the relay still had us.
+    const QList<QString> claimed = m_claimed.values();
+    for (const QString &id : claimed) {
+        writeClaim(id, true);
+    }
 }
 
 void TcpServer::onControlDisconnected()
 {
+    m_heartbeatTimer->stop();
     m_controlRx.clear();
+    m_listEpoch.clear();
     QStringList ids;
     QList<ClientHandler *> handlers;
     {
@@ -361,7 +510,37 @@ void TcpServer::handleRelayJson(const QByteArray &payload)
         return;
     }
     if (type == QLatin1String("peer_offline")) {
-        applyPeerOffline(object.value(QStringLiteral("id")).toString());
+        applyPeerOffline(object.value(QStringLiteral("id")).toString(),
+                         object.value(QStringLiteral("busy")).toBool(false),
+                         object.value(QStringLiteral("ended")).toBool(false),
+                         quint32(object.value(QStringLiteral("sessionId")).toDouble()));
+        return;
+    }
+    if (type == QLatin1String("claim_ok")) {
+        const QString agentId = object.value(QStringLiteral("agentId")).toString().trimmed();
+        if (!agentId.isEmpty()) {
+            const QString key = object.value(QStringLiteral("controlKey")).toString();
+            m_claimed.insert(agentId);
+            m_controlKeys.insert(agentId, key);
+            // A handler may already exist when this answers a re-claim after a
+            // relay reconnect, so the live one needs the new key too.
+            if (ClientHandler *live = handlerForId(agentId)) {
+                live->setControlKey(key);
+            }
+            emit agentClaimed(agentId,
+                              qint64(object.value(QStringLiteral("remainMs")).toDouble()),
+                              key);
+        }
+        return;
+    }
+    if (type == QLatin1String("claim_denied")) {
+        const QString agentId = object.value(QStringLiteral("agentId")).toString().trimmed();
+        if (!agentId.isEmpty()) {
+            m_claimed.remove(agentId);
+            m_controlKeys.remove(agentId);
+            emit agentClaimDenied(agentId,
+                                  object.value(QStringLiteral("reason")).toString());
+        }
         return;
     }
     if (type == QLatin1String("ack") || type == QLatin1String("error")) {
@@ -379,6 +558,9 @@ void TcpServer::applyPeerOnline(const QJsonObject &object)
     ClientInfo info;
     info.id = object.value(QStringLiteral("id")).toString().trimmed();
     if (info.id.isEmpty()) {
+        return;
+    }
+    if (!noteListEpoch(info.id, quint32(object.value(QStringLiteral("sessionId")).toDouble()))) {
         return;
     }
     info.phoneNumber = info.id;
@@ -403,9 +585,45 @@ void TcpServer::applyPeerOnline(const QJsonObject &object)
                     false);
 }
 
-void TcpServer::applyPeerOffline(const QString &agentId)
+bool TcpServer::noteListEpoch(const QString &agentId, quint32 sessionId)
+{
+    if (agentId.isEmpty() || sessionId == 0) {
+        return true;
+    }
+    const quint32 ended = m_endedEpoch.value(agentId, 0);
+    if (ended != 0 && sessionId <= ended) {
+        return false;
+    }
+    if (ended != 0) {
+        m_endedEpoch.remove(agentId);
+    }
+    const quint32 prev = m_listEpoch.value(agentId, 0);
+    if (sessionId < prev) {
+        return false;
+    }
+    m_listEpoch.insert(agentId, sessionId);
+    return true;
+}
+
+void TcpServer::applyPeerOffline(const QString &agentId, bool busy, bool ended, quint32 sessionId)
 {
     if (agentId.isEmpty()) {
+        return;
+    }
+    if (!noteListEpoch(agentId, sessionId)) {
+        return;
+    }
+    if (ended && sessionId != 0) {
+        const quint32 prev = m_endedEpoch.value(agentId, 0);
+        if (sessionId > prev) {
+            m_endedEpoch.insert(agentId, sessionId);
+        }
+    }
+    // Another operator has the preview open. Drop it from this list without
+    // tearing down a handler or marking the phone offline. A real end wins:
+    // the phone left, so the row has to go even if it was hidden as busy.
+    if (busy && !ended) {
+        emit clientBusy(agentId);
         return;
     }
     ClientHandler *handler = nullptr;
@@ -416,6 +634,14 @@ void TcpServer::applyPeerOffline(const QString &agentId)
     }
     if (handler) {
         closeHandler(handler, false);
+    }
+    if (ended) {
+        m_claimed.remove(agentId);
+        emit clientRemoved(agentId);
+        emit logMessage(QStringLiteral("%1 Sharing ended: %2")
+                            .arg(formatTimestamp(), agentId),
+                        false);
+        return;
     }
     emit clientDisconnected(agentId);
     emit logMessage(QStringLiteral("%1 Mobile offline: %2")
@@ -429,6 +655,7 @@ ClientHandler *TcpServer::adoptSocket(QTcpSocket *socket, const ClientInfo &iden
     auto *handler = new ClientHandler(socket);
     handler->bindIdentity(identity);
     handler->setUdpRelay(m_relayHost, 9000, m_desktopId);
+    handler->setControlKey(m_controlKeys.value(identity.id));
 
     auto *ioThread = new QThread(this);
     handler->moveToThread(ioThread);

@@ -62,6 +62,22 @@ public final class AgentInput {
         // utility
     }
 
+    /** Desktop pointer. {@code visible} false removes the yellow circle. */
+    public static void cursor(Context context, float nx, float ny, boolean visible) {
+        AgentInputService service = AgentInputService.get();
+        if (service == null) {
+            return;
+        }
+        if (!visible) {
+            service.hideCursor();
+            return;
+        }
+        int[] size = screenSize(context);
+        int x = clamp((int) (nx * size[0]), 0, Math.max(0, size[0] - 1));
+        int y = clamp((int) (ny * size[1]), 0, Math.max(0, size[1] - 1));
+        service.showCursor(x, y);
+    }
+
     public static void touch(Context context, String action, float nx, float ny) {
         int[] size = screenSize(context);
         int x = clamp((int) (nx * size[0]), 0, size[0] - 1);
@@ -75,6 +91,76 @@ public final class AgentInput {
         if (!tryInjectMotion(context, action, x, y)) {
             logInputDropped("touch " + action);
         }
+    }
+
+    private static final ExecutorService tapExec = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "InputTap");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /**
+     * A click the accessibility gesture could not deliver. InputManager works on
+     * emulators that allow it; {@code input tap} covers the rest. Returns true
+     * only when InputManager accepted both the down and the up, so the caller
+     * does not also click the node and fire the control twice.
+     */
+    public static boolean injectTap(Context context, int x, int y) {
+        if (context == null) {
+            return false;
+        }
+        boolean down = tryInjectMotion(context, "down", x, y);
+        boolean up = tryInjectMotion(context, "up", x, y);
+        if (down && up) {
+            return true;
+        }
+        final int px = x;
+        final int py = y;
+        tapExec.execute(() -> runShell(new String[]{
+                "input", "tap", Integer.toString(px), Integer.toString(py)
+        }));
+        return false;
+    }
+
+    /**
+     * One key press. Used when the accessibility action for Enter did not run.
+     * InputManager first; {@code input keyevent} if that is refused.
+     *
+     * Always off the caller's thread. injectInputEvent is a synchronous binder
+     * call with no timeout and the shell fallback spawns a process, so running
+     * either on the accessibility main thread lets one slow call block every tap,
+     * gesture and text edit queued behind it — the whole keyboard going dead.
+     */
+    public static void pressKey(Context context, int keyCode) {
+        if (context == null) {
+            return;
+        }
+        final Context app = context.getApplicationContext();
+        final int code = keyCode;
+        submitNav(() -> {
+            // Always release the key. A down that never gets its up stays held in
+            // the input dispatcher, and every later key — letters included — is
+            // swallowed until the process restarts. Shell only when the down was
+            // refused: a shell press on top of a down the system already accepted
+            // moves a selection twice.
+            boolean downOk = tryInjectKey(app, code, true, 0);
+            boolean upOk = tryInjectKey(app, code, false, 0);
+            if (downOk && !upOk) {
+                // One more try, then let the shell press close it out.
+                upOk = tryInjectKey(app, code, false, 0);
+            }
+            if (downOk && upOk) {
+                return;
+            }
+            // With su known to work, use it first: a plain "input" from the app uid
+            // is refused, and on some builds it still exits 0, which would stop here.
+            if (Boolean.TRUE.equals(suAvailable) && shellKeyElevated(code)) {
+                return;
+            }
+            if (!runShellTimed(new String[]{"input", "keyevent", Integer.toString(code)}, 1500L)) {
+                shellKeyElevated(code);
+            }
+        });
     }
 
     public static void scroll(Context context, float nx, float ny, float vertical) {
@@ -107,13 +193,26 @@ public final class AgentInput {
     }
 
     public static void key(Context context, int keyCode, boolean down) {
+        key(context, keyCode, down, 0);
+    }
+
+    public static void key(Context context, int keyCode, boolean down, int meta) {
+        final boolean alt = (meta & KeyEvent.META_ALT_ON) != 0;
+        final boolean ctrl = (meta & KeyEvent.META_CTRL_ON) != 0;
+        // Alt+Tab is the desktop app switcher. On the phone that is Recents.
+        if (alt && !ctrl && keyCode == KeyEvent.KEYCODE_TAB) {
+            if (!down) {
+                key(context, KeyEvent.KEYCODE_APP_SWITCH, false, 0);
+            }
+            return;
+        }
         // Navigation keys (Back/Home/Recents) go through the accessibility global
         // actions. On some system-privileged boards (e.g. LVK3588SF / RK3588,
         // Android 12) injectInputEvent reports success but the injected
         // HOME/BACK/APP_SWITCH keys are dropped by the window policy, so the old
         // "inject first" path returned early and did nothing. performGlobalAction
         // is the portable mechanism other devices already fall back to.
-        if (isNavKey(keyCode)) {
+        if (meta == 0 && isNavKey(keyCode)) {
             if (down) {
                 // Act once, on key-up, to avoid double navigation.
                 return;
@@ -157,7 +256,46 @@ public final class AgentInput {
             }
             return;
         }
-        if (tryInjectKey(context, keyCode, down)) {
+        if (isCaretKey(keyCode)) {
+            // Home/End and the arrows edit the focused field, including Shift
+            // and Ctrl chords. A plain left/right with no field still pans.
+            if (!down) {
+                return;
+            }
+            ensureAccessibility(context);
+            AgentInputService edit = AgentInputService.get();
+            if (edit != null && edit.editKey(keyCode, meta)) {
+                return;
+            }
+            if (meta == 0 && edit != null && isArrowKey(keyCode)) {
+                // Nothing is being edited, so this arrow moves the selection.
+                // One press is queued as one step.
+                edit.arrowKey(keyCode);
+                return;
+            }
+            tryInjectKey(context, keyCode, true, meta);
+            tryInjectKey(context, keyCode, false, meta);
+            return;
+        }
+        if (meta == 0 && (keyCode == KeyEvent.KEYCODE_DEL
+                || keyCode == KeyEvent.KEYCODE_FORWARD_DEL
+                || keyCode == KeyEvent.KEYCODE_ENTER
+                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER)) {
+            // Injecting the key reports success even when no field has it, which
+            // used to skip the edit that actually deletes or submits.
+            if (down) {
+                return;
+            }
+            ensureAccessibility(context);
+            AgentInputService edit = AgentInputService.get();
+            if (edit != null && edit.handleKey(keyCode)) {
+                return;
+            }
+            tryInjectKey(context, keyCode, true);
+            tryInjectKey(context, keyCode, false);
+            return;
+        }
+        if (tryInjectKey(context, keyCode, down, meta)) {
             return;
         }
         if (down) {
@@ -219,6 +357,22 @@ public final class AgentInput {
         }
     }
 
+    private static boolean isArrowKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_DPAD_LEFT
+                || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
+                || keyCode == KeyEvent.KEYCODE_DPAD_UP
+                || keyCode == KeyEvent.KEYCODE_DPAD_DOWN;
+    }
+
+    private static boolean isCaretKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_DPAD_LEFT
+                || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
+                || keyCode == KeyEvent.KEYCODE_DPAD_UP
+                || keyCode == KeyEvent.KEYCODE_DPAD_DOWN
+                || keyCode == KeyEvent.KEYCODE_MOVE_HOME
+                || keyCode == KeyEvent.KEYCODE_MOVE_END;
+    }
+
     private static boolean isNavKey(int keyCode) {
         return keyCode == KeyEvent.KEYCODE_BACK
                 || keyCode == KeyEvent.KEYCODE_HOME
@@ -276,6 +430,24 @@ public final class AgentInput {
             AgentInputService.enqueueNav(keyCode);
             return;
         }
+    }
+
+    /**
+     * True when this process can deliver a real key event: it holds INJECT_EVENTS
+     * (system / platform-signed builds) or su exists. Blocks for a short probe the
+     * first time, so call it off the main thread.
+     */
+    public static boolean canSendRealKeys(Context context) {
+        if (context != null && context.checkSelfPermission("android.permission.INJECT_EVENTS")
+                == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        Boolean su = suAvailable;
+        if (su == null) {
+            su = probeSu();
+            suAvailable = su;
+        }
+        return Boolean.TRUE.equals(su);
     }
 
     private static boolean shellKeyElevated(int keyCode) {
@@ -419,16 +591,44 @@ public final class AgentInput {
         if (value == null || value.isEmpty()) {
             return;
         }
+        ensureAccessibility(context);
+        AgentInputService service = AgentInputService.get();
+        // Key injection reports success without the character landing in the
+        // focused field. The field's own text is what the operator is typing into.
+        if (service != null && service.typeText(value)) {
+            return;
+        }
         if (tryInjectText(context, value)) {
             return;
         }
         if (shellText(value)) {
             return;
         }
-        ensureAccessibility(context);
+    }
+
+    /** Drop a stuck pointer so the next controller's first click is a click. */
+    public static void releasePointer() {
         AgentInputService service = AgentInputService.get();
         if (service != null) {
-            service.typeText(value);
+            service.releasePointer();
+        }
+    }
+
+    /**
+     * Copy, cut, paste and select-all on the focused field. [text] is the
+     * controller clipboard, used when the phone cannot paste on its own.
+     */
+    public static void clipboard(Context context, String action, String text) {
+        if (action == null || action.isEmpty()) {
+            return;
+        }
+        ensureAccessibility(context);
+        AgentInputService service = AgentInputService.get();
+        if (service != null && service.clipboard(action, text)) {
+            return;
+        }
+        if ("paste".equals(action) && text != null && !text.isEmpty()) {
+            text(context, text);
         }
     }
 
@@ -659,7 +859,9 @@ public final class AgentInput {
 
     private static boolean shellKey(int keyCode) {
         String code = Integer.toString(keyCode);
-        return runShell(new String[]{"input", "keyevent", code});
+        // Bounded: this runs on the input thread, and an "input" that never exits
+        // would hold every later key behind it.
+        return runShellTimed(new String[]{"input", "keyevent", code}, 1500L);
     }
 
     private static boolean shellText(String value) {
@@ -667,7 +869,7 @@ public final class AgentInput {
         if (escaped.isEmpty()) {
             return false;
         }
-        return runShell(new String[]{"input", "text", escaped});
+        return runShellTimed(new String[]{"input", "text", escaped}, 1500L);
     }
 
     private static String escapeInputText(String value) {
@@ -765,12 +967,38 @@ public final class AgentInput {
         return ok;
     }
 
+    private static final java.util.HashMap<Integer, Long> keyDownAt = new java.util.HashMap<>();
+
     private static boolean tryInjectKey(Context context, int keyCode, boolean down) {
+        return tryInjectKey(context, keyCode, down, 0);
+    }
+
+    private static boolean tryInjectKey(Context context, int keyCode, boolean down, int meta) {
         long now = SystemClock.uptimeMillis();
-        KeyEvent event = new KeyEvent(now, now,
+        long downAt;
+        synchronized (keyDownAt) {
+            if (down) {
+                Long existing = keyDownAt.get(keyCode);
+                downAt = existing != null ? existing : now;
+                if (existing == null) {
+                    keyDownAt.put(keyCode, downAt);
+                }
+            } else {
+                Long existing = keyDownAt.remove(keyCode);
+                downAt = existing != null ? existing : now;
+            }
+        }
+        KeyEvent event = new KeyEvent(
+                downAt,
+                now,
                 down ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP,
-                keyCode, 0);
-        event.setSource(InputDevice.SOURCE_KEYBOARD);
+                keyCode,
+                0,
+                meta,
+                KeyCharacterMap.VIRTUAL_KEYBOARD,
+                0,
+                0,
+                InputDevice.SOURCE_KEYBOARD);
         return inject(context, event);
     }
 
@@ -837,22 +1065,24 @@ public final class AgentInput {
     }
 
     private static int[] screenSize(Context context) {
-        WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-        Point point = new Point();
-        if (wm != null) {
-            if (Build.VERSION.SDK_INT >= 30) {
-                android.graphics.Rect bounds = wm.getMaximumWindowMetrics().getBounds();
-                point.x = Math.max(2, bounds.width());
-                point.y = Math.max(2, bounds.height());
-            } else {
-                wm.getDefaultDisplay().getRealSize(point);
+        // Current orientation, not the maximum window. That one stays portrait
+        // after the phone rotates, so a landscape click lands in the wrong place.
+        try {
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager) context.getSystemService(
+                            Context.DISPLAY_SERVICE);
+            android.view.Display display = dm != null
+                    ? dm.getDisplay(android.view.Display.DEFAULT_DISPLAY) : null;
+            if (display != null) {
+                android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+                display.getRealMetrics(metrics);
+                if (metrics.widthPixels > 1 && metrics.heightPixels > 1) {
+                    return new int[]{metrics.widthPixels, metrics.heightPixels};
+                }
             }
+        } catch (Throwable ignored) {
         }
-        if (point.x <= 0 || point.y <= 0) {
-            point.x = 1080;
-            point.y = 1920;
-        }
-        return new int[]{point.x, point.y};
+        return new int[]{1080, 1920};
     }
 
     private static int clamp(int value, int min, int max) {

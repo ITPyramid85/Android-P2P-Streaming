@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
 import android.media.ImageReader;
@@ -18,11 +19,13 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Process;
 import android.util.DisplayMetrics;
+import android.view.Display;
 import android.view.Surface;
 import android.view.WindowManager;
 
 import com.screencapture.app.FrameBridge;
 import com.screencapture.app.ProjectionResultHolder;
+import com.screencapture.app.net.StreamMetrics;
 
 import android.os.SystemClock;
 
@@ -45,7 +48,11 @@ public final class SilentScreenStreamer {
      * Climbing 768→960→1228 (13:55:08–19) immediately re-blocked.
      * Text is readable at 960x540 q=50; never return to 1228.
      */
-    private static final int MAX_JPEG_QUALITY = 30;
+    // Ceiling the controller may climb to when the link has headroom. Raised from
+    // 30: at 0.50 scale a frame is a quarter of the pixels, so a crisper JPEG still
+    // costs far less than a full-size keyframe, and the floor below keeps congested
+    // links behaving exactly as before.
+    private static final int MAX_JPEG_QUALITY = 45;
     private static final int MIN_JPEG_QUALITY = 22;
     private static final int JPEG_QUALITY_STEP = 5;
     private static final float[] SCALE_STEPS = {0.50f};
@@ -62,10 +69,10 @@ public final class SilentScreenStreamer {
     /** Enough slots to hold every bitmap in circulation so none is reallocated. */
     private static final int MAX_POOLED_BITMAPS = MAX_ENCODE_QUEUE + 2;
     /**
-     * 66ms ≈ 15fps. At the logged 5KB tile size that is ~75KB/s, in range
-     * of the 40–70KB/s uplink. 1228x690 at 10fps was 300–500KB/s.
+     * 33ms ≈ 30fps, reached only while the desktop's frame_rx feedback reports no
+     * queueing and no loss (see onPathFeedback).
      */
-    private static final long MIN_INTERVAL_MS = 50;
+    private static final long MIN_INTERVAL_MS = 33;
     /**
      * Static-screen keepalive (see startKeepalive): if no frame has been produced
      * for KEEPALIVE_IDLE_MS, force one fresh frame. Checked every KEEPALIVE_TICK_MS
@@ -75,9 +82,36 @@ public final class SilentScreenStreamer {
     private static final long KEEPALIVE_IDLE_MS = 1000;
     private static final long KEEPALIVE_TICK_MS = 400;
     /**
-     * Congested floor: 150ms (~7fps). 500ms (2fps) is what froze 081729.
+     * Congested floor: 250ms (4fps). Pinning this to MIN_INTERVAL_MS left the
+     * stream no way to slow down on a link that cannot carry 20fps, so the surplus
+     * sat in the relay and router queues as delay. 500ms (2fps) is what froze 081729.
      */
-    private static final long MAX_INTERVAL_MS = 50;
+    private static final long MAX_INTERVAL_MS = 250;
+
+    /*
+     * Path feedback controller (onPathFeedback). The desktop echoes frame_rx about
+     * every 200ms with the slice loss it saw; matched against our capture time
+     * that gives the full loop. Loop minus the lowest loop seen recently is queueing
+     * delay — the thing the user perceives as lag — and it is measured end to end,
+     * which write-blocking time on a UDP socket never was.
+     */
+    /** Feedback newer than this disables the write-blocking controller. */
+    private static final long FEEDBACK_FRESH_MS = 3000;
+    /** Queueing above this, or loss above LOSS_HIGH, means slow down. */
+    private static final long QUEUE_HIGH_MS = 120;
+    /** Queueing below this with loss below LOSS_LOW means there is headroom. */
+    private static final long QUEUE_LOW_MS = 40;
+    /** A loop this long is congestion whatever the baseline says. */
+    private static final long LOOP_CEILING_MS = 500;
+    private static final double LOSS_HIGH = 5.0;
+    private static final double LOSS_LOW = 1.0;
+    /** Baseline is the minimum loop over the current and previous window. */
+    private static final long BASE_WINDOW_MS = 10000;
+    /** Give a back-off this long to drain the queue before judging it again. */
+    private static final long BACKOFF_HOLD_MS = 400;
+    /** No speed-up for this long after a back-off, so the rate does not oscillate. */
+    private static final long RECOVER_HOLD_MS = 1500;
+    private static final long RECOVER_INTERVAL_STEP_MS = 4;
     /** Unchanged screen is resent at this gap so a still picture stays alive. */
     private static final long STILL_INTERVAL_MS = 300;
     private static final long INTERVAL_STEP_MS = 4;
@@ -207,6 +241,8 @@ public final class SilentScreenStreamer {
     private long lastKeyframeAt;
     private volatile boolean forceKeyframe = true;
     private volatile boolean rushFrame = false;
+    /** Cursor generation last copied into a frame, so a still screen still follows the pointer. */
+    private int paintedCursorSeq;
 
     private HandlerThread thread;
     private Handler handler;
@@ -214,6 +250,28 @@ public final class SilentScreenStreamer {
     private Context app;
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
+    private boolean displayWatching;
+    private final DisplayManager.DisplayListener displayListener =
+            new DisplayManager.DisplayListener() {
+                @Override
+                public void onDisplayAdded(int displayId) {
+                }
+
+                @Override
+                public void onDisplayRemoved(int displayId) {
+                }
+
+                @Override
+                public void onDisplayChanged(int displayId) {
+                    if (displayId != Display.DEFAULT_DISPLAY) {
+                        return;
+                    }
+                    Handler h = handler;
+                    if (h != null) {
+                        h.post(SilentScreenStreamer.this::applyRotationLocked);
+                    }
+                }
+            };
     private ImageReader imageReader;
     private MediaCodec videoEncoder;
     private Surface encoderInputSurface;
@@ -318,6 +376,83 @@ public final class SilentScreenStreamer {
         INSTANCE.intervalMs = Math.min(MAX_INTERVAL_MS, cur + 40);
     }
 
+    // Path feedback state. Written from the network threads, so guarded separately
+    // from `lock`, which the capture and encode threads hold.
+    private final Object feedbackLock = new Object();
+    private volatile long pathFeedbackAt;
+    private long baseLoopPrevMin = Long.MAX_VALUE;
+    private long baseLoopCurMin = Long.MAX_VALUE;
+    private long baseWindowAt;
+    private long lastBackoffAt;
+
+    /**
+     * One frame_rx echo: [loopMs] from capture to the desktop's screen and back,
+     * [lossPercent] of video slices the desktop never received since the previous
+     * echo (negative if unknown).
+     */
+    public static void onPathFeedback(long loopMs, double lossPercent) {
+        INSTANCE.pathFeedback(loopMs, lossPercent);
+    }
+
+    /**
+     * Frames are going out but nothing is coming back: either every frame is losing
+     * a slice or the queue is longer than the probe ring. Both mean slow down.
+     */
+    public static void onPathStall() {
+        INSTANCE.pathFeedback(LOOP_CEILING_MS * 4, 100.0);
+    }
+
+    private void pathFeedback(long loopMs, double lossPercent) {
+        if (loopMs < 0) {
+            return;
+        }
+        synchronized (feedbackLock) {
+            final long now = SystemClock.uptimeMillis();
+            pathFeedbackAt = now;
+            tuned = true;
+            if (baseWindowAt == 0 || now - baseWindowAt >= BASE_WINDOW_MS) {
+                baseLoopPrevMin = baseLoopCurMin;
+                baseLoopCurMin = Long.MAX_VALUE;
+                baseWindowAt = now;
+            }
+            if (loopMs < baseLoopCurMin) {
+                baseLoopCurMin = loopMs;
+            }
+            final long base = Math.min(baseLoopPrevMin, baseLoopCurMin);
+            final long queueMs = loopMs - base;
+            final boolean congested = queueMs > QUEUE_HIGH_MS
+                    || loopMs > LOOP_CEILING_MS
+                    || lossPercent > LOSS_HIGH;
+            if (congested) {
+                if (now - lastBackoffAt < BACKOFF_HOLD_MS) {
+                    return;
+                }
+                lastBackoffAt = now;
+                // Rate first and multiplicatively: a standing queue only drains when
+                // we send clearly less than the link carries, and frames are the
+                // largest lever left. Quality goes down alongside it.
+                intervalMs = Math.min(MAX_INTERVAL_MS, intervalMs * 3 / 2 + 10);
+                if (jpegQuality > MIN_JPEG_QUALITY) {
+                    jpegQuality = Math.max(MIN_JPEG_QUALITY, jpegQuality - JPEG_QUALITY_STEP);
+                }
+                return;
+            }
+            if (queueMs < QUEUE_LOW_MS && lossPercent < LOSS_LOW
+                    && now - lastBackoffAt >= RECOVER_HOLD_MS) {
+                if (intervalMs > MIN_INTERVAL_MS) {
+                    intervalMs = Math.max(MIN_INTERVAL_MS, intervalMs - RECOVER_INTERVAL_STEP_MS);
+                } else if (jpegQuality < MAX_JPEG_QUALITY) {
+                    jpegQuality = Math.min(MAX_JPEG_QUALITY, jpegQuality + 1);
+                }
+            }
+        }
+    }
+
+    private boolean pathFeedbackFresh() {
+        final long at = pathFeedbackAt;
+        return at != 0 && SystemClock.uptimeMillis() - at < FEEDBACK_FRESH_MS;
+    }
+
     /**
      * Account one sent frame and, when the window closes, size the stream to the
      * throughput actually measured.
@@ -375,6 +510,13 @@ public final class SilentScreenStreamer {
         resetStatWindow();
         statWindowAt = now;
         if (frames == 0) {
+            return;
+        }
+        // On UDP this controller sees no blocking and reads every window as a clear
+        // link, so recoverClearLink would undo each path-feedback back-off within
+        // one window. It only stays in charge while no feedback is arriving (an
+        // older desktop build).
+        if (pathFeedbackFresh()) {
             return;
         }
         final long bps = bytes * 1000L / windowMs;
@@ -586,6 +728,77 @@ public final class SilentScreenStreamer {
     }
 
     /**
+     * The phone turned. The capture buffer was created at the old orientation, so
+     * a landscape screen was still being sent as a portrait picture and clicks
+     * no longer lined up with it.
+     */
+    private void applyRotationLocked() {
+        synchronized (lock) {
+            if (!running || h264Active || virtualDisplay == null || imageReader == null
+                    || handler == null) {
+                return;
+            }
+            int[] size = computeCaptureSize();
+            int w = size[0];
+            int h = size[1];
+            if (w == captureWidth && h == captureHeight) {
+                return;
+            }
+            ImageReader newReader;
+            try {
+                newReader = ImageReader.newInstance(
+                        w, h, PixelFormat.RGBA_8888, IMAGE_READER_MAX_IMAGES);
+            } catch (Exception e) {
+                return;
+            }
+            newReader.setOnImageAvailableListener(this::onImage, handler);
+            try {
+                virtualDisplay.resize(w, h, captureDpi);
+                virtualDisplay.setSurface(newReader.getSurface());
+            } catch (Exception e) {
+                newReader.close();
+                return;
+            }
+            ImageReader old = imageReader;
+            imageReader = newReader;
+            old.setOnImageAvailableListener(null, null);
+            old.close();
+            captureWidth = w;
+            captureHeight = h;
+            lastFrameAt = 0;
+            lastFrameHash = 0;
+            forceKeyframe = true;
+            resetStatWindow();
+        }
+    }
+
+    private void watchDisplay() {
+        if (displayWatching) {
+            return;
+        }
+        DisplayManager dm = (DisplayManager) app.getSystemService(Context.DISPLAY_SERVICE);
+        if (dm == null) {
+            return;
+        }
+        dm.registerDisplayListener(displayListener, handler);
+        displayWatching = true;
+    }
+
+    private void unwatchDisplay() {
+        if (!displayWatching) {
+            return;
+        }
+        displayWatching = false;
+        try {
+            DisplayManager dm = (DisplayManager) app.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                dm.unregisterDisplayListener(displayListener);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
      * After a remote Back/Home/touch the screen changes, but a high capture
      * interval would otherwise delay the first updated frame. One nudge is enough.
      */
@@ -675,6 +888,13 @@ public final class SilentScreenStreamer {
             tuned = false;
             unblockedStreak = 0;
             linkBps = 0;
+            synchronized (feedbackLock) {
+                pathFeedbackAt = 0;
+                baseLoopPrevMin = Long.MAX_VALUE;
+                baseLoopCurMin = Long.MAX_VALUE;
+                baseWindowAt = 0;
+                lastBackoffAt = 0;
+            }
             lastFullFrameBytes = 0;
             staticKeyframeIntervalMs = KEYFRAME_INTERVAL_MS;
             resetStatWindow();
@@ -731,6 +951,7 @@ public final class SilentScreenStreamer {
                 h264ProducedFrame = false;
                 final MediaProjection watched = mediaProjection;
                 handler.postDelayed(() -> checkH264Health(watched), H264_HEALTH_TIMEOUT_MS);
+                watchDisplay();
                 return true;
             } catch (Exception e) {
                 teardownH264Locked();
@@ -755,6 +976,7 @@ public final class SilentScreenStreamer {
             // kicks to make sure that first picture is not missed on a static screen.
             kickFreshFrameBurst();
             startKeepalive();
+            watchDisplay();
             return true;
         } catch (Exception e) {
             releaseSurfacesLocked();
@@ -893,7 +1115,8 @@ public final class SilentScreenStreamer {
                             System.arraycopy(csd, 0, payload, 0, csd.length);
                             System.arraycopy(nal, 0, payload, csd.length, nal.length);
                         }
-                        FrameBridge.sendFrame(payload, captureWidth, captureHeight, payload.length);
+                        FrameBridge.sendFrame(payload, captureWidth, captureHeight, payload.length,
+                                SystemClock.uptimeMillis());
                         h264ProducedFrame = true;
                         framesSent++;
                     }
@@ -1298,15 +1521,24 @@ public final class SilentScreenStreamer {
             }
             framesSeen++;
             long now = System.currentTimeMillis();
-            if (!rushFrame && lastFrameAt != 0 && now - lastFrameAt < intervalMs) {
+            RemoteCursor.Spot cursor = RemoteCursor.spot();
+            boolean cursorDirty = cursor.seq != paintedCursorSeq;
+            if (!rushFrame && !cursorDirty && lastFrameAt != 0 && now - lastFrameAt < intervalMs) {
+                StreamMetrics.noteSkippedInterval();
                 return;
             }
             // Hash each tile, not just the whole frame. The combined value still
             // skips a completely static screen for free, and the per-tile values
             // tell the encoder which regions actually have to be sent.
+            // A moving pointer does not change those pixels (the overlay is left
+            // out of the capture), so it has to count as a change on its own.
+            long hashStartedAt = SystemClock.uptimeMillis();
             long frameHash = hashTiles(image, tileHashes);
+            StreamMetrics.noteCaptured(SystemClock.uptimeMillis() - hashStartedAt);
             boolean unchanged = frameHash != 0 && frameHash == lastFrameHash && !forceKeyframe;
-            if (!rushFrame && unchanged && lastFrameAt != 0 && now - lastFrameAt < STILL_INTERVAL_MS) {
+            if (!rushFrame && unchanged && !cursorDirty && lastFrameAt != 0
+                    && now - lastFrameAt < STILL_INTERVAL_MS) {
+                StreamMetrics.noteSkippedUnchanged();
                 return;
             }
             Bitmap frame = copyImageToBitmap(image);
@@ -1315,7 +1547,8 @@ public final class SilentScreenStreamer {
             }
             lastFrameAt = now;
             lastFrameHash = frameHash;
-            offerEncode(new PendingFrame(frame, tileHashes.clone()));
+            paintedCursorSeq = cursor.seq;
+            offerEncode(new PendingFrame(frame, tileHashes.clone(), SystemClock.uptimeMillis()));
         } catch (Exception e) {
             // A stop() racing an in-flight frame closes the reader/image under us.
             // That is expected teardown, not a fault.
@@ -1338,6 +1571,7 @@ public final class SilentScreenStreamer {
                 }
                 // The skipped frame's tiles were never sent, so its hashes must not
                 // count as delivered — the next frame has to resend those regions.
+                StreamMetrics.noteSkippedQueue();
                 releaseBitmap(stale.bitmap);
             }
             if (!encodeQueue.offer(frame)) {
@@ -1382,6 +1616,7 @@ public final class SilentScreenStreamer {
             // too. Nothing is recorded as sent, so whatever changed here is still
             // pending and the next frame that does go out carries it.
             if (FrameBridge.isSendBusy() && !rushFrame) {
+                StreamMetrics.noteSkippedBusy();
                 return;
             }
             rushFrame = false;
@@ -1427,7 +1662,9 @@ public final class SilentScreenStreamer {
             // 0.8–1s of delay between the phone screen and the desktop.
             final boolean full = true;
             int quality = jpegQuality;
+            final long encodeStartedAt = SystemClock.uptimeMillis();
             if (full) {
+                RemoteCursor.drawOn(bitmap);
                 jpegOut.reset();
                 if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, jpegOut)) {
                     return;
@@ -1466,7 +1703,15 @@ public final class SilentScreenStreamer {
             final int tilesSent = full ? TILE_COUNT : changed;
             final boolean key = full;
             int length = jpegOut.size();
-            boolean sent = FrameBridge.sendFrame(jpegOut.buffer(), width, height, length);
+            StreamMetrics.noteEncoded(SystemClock.uptimeMillis() - encodeStartedAt, length);
+            StreamMetrics.noteOperatingPoint(
+                    intervalMs, quality, scaleIndex, linkBps, width, height);
+            boolean sent = FrameBridge.sendFrame(
+                    jpegOut.buffer(), width, height, length, pending.capturedAt);
+            // Capture to hand-off, which is the part of the delay this process owns:
+            // the compositor's frame has been waiting this long before a single byte
+            // of it left for the desktop.
+            StreamMetrics.noteHandedOff(sent, SystemClock.uptimeMillis() - pending.capturedAt);
             if (sent) {
                 // Only a delivered tile counts as the viewer's current picture. On a
                 // failed write nothing is recorded, so the next frame resends the
@@ -1810,10 +2055,13 @@ public final class SilentScreenStreamer {
     private static final class PendingFrame {
         final Bitmap bitmap;
         final long[] hashes;
+        /** uptimeMillis the compositor handed this frame over, for stage timing. */
+        final long capturedAt;
 
-        PendingFrame(Bitmap bitmap, long[] hashes) {
+        PendingFrame(Bitmap bitmap, long[] hashes, long capturedAt) {
             this.bitmap = bitmap;
             this.hashes = hashes;
+            this.capturedAt = capturedAt;
         }
     }
 
@@ -1828,20 +2076,20 @@ public final class SilentScreenStreamer {
     }
 
     private int[] computeCaptureSize() {
-        WindowManager wm = (WindowManager) app.getSystemService(Context.WINDOW_SERVICE);
         int width = 1080;
         int height = 1920;
-        if (wm != null) {
-            if (Build.VERSION.SDK_INT >= 30) {
-                Rect bounds = wm.getMaximumWindowMetrics().getBounds();
-                width = Math.max(2, bounds.width());
-                height = Math.max(2, bounds.height());
-            } else {
+        try {
+            DisplayManager dm = (DisplayManager) app.getSystemService(Context.DISPLAY_SERVICE);
+            Display display = dm != null ? dm.getDisplay(Display.DEFAULT_DISPLAY) : null;
+            if (display != null) {
                 DisplayMetrics metrics = new DisplayMetrics();
-                wm.getDefaultDisplay().getRealMetrics(metrics);
-                width = Math.max(2, metrics.widthPixels);
-                height = Math.max(2, metrics.heightPixels);
+                display.getRealMetrics(metrics);
+                if (metrics.widthPixels > 1 && metrics.heightPixels > 1) {
+                    width = metrics.widthPixels;
+                    height = metrics.heightPixels;
+                }
             }
+        } catch (Throwable ignored) {
         }
         nativeWidth = width;
         nativeHeight = height;
@@ -1856,6 +2104,7 @@ public final class SilentScreenStreamer {
     }
 
     private void releaseSurfacesLocked() {
+        unwatchDisplay();
         // Release the display first so no more frames are pushed into either the
         // ImageReader or the encoder input surface, then tear down the consumers.
         if (virtualDisplay != null) {

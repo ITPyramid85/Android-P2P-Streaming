@@ -48,9 +48,25 @@ public:
      * must be able to attach again instead of staying blacked out until reopened.
      */
     std::function<ClientHandler *()> reattachProvider;
+    // True once this mobile has left the list. The window closes instead of
+    // waiting to re-attach.
+    std::function<bool()> shareGone;
 
     QString agentId() const { return m_agentId; }
+    void setInternetOffline(bool offline);
     void requestStop();
+    // The phone left the relay. Close without sending another stop to a dead handler.
+    void abandon();
+    // Time the relay says is left in this mobile's sharing session.
+    void setSessionRemaining(qint64 remainMs);
+
+signals:
+    // The operator pressed Stop. Sharing and remote control end; the app stays up.
+    void sharingStopRequested(const QString &agentId);
+    // The phone ended the share. Closing this window must not hand it back.
+    void remoteStopped(const QString &agentId);
+    // This window's hour ran out. The relay ends the offer for every controller.
+    void sessionHourElapsed(const QString &agentId);
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -68,13 +84,17 @@ private slots:
     void sendNavRecents();
     void onStopClicked();
     void onSessionLimitReached();
+    void onCursorFlush();
 
 private:
     void bindHandler(ClientHandler *handler);
+    void writeCursor(double nx, double ny, bool visible);
     bool sendRemoteKey(QKeyEvent *event, bool down);
-    void sendAndroidKey(int keyCode, bool down);
+    void sendAndroidKey(int keyCode, bool down, int meta = 0);
     void sendTouch(const char *action, double nx, double ny);
+    void sendCursor(double nx, double ny, bool visible);
     void sendText(const QString &text);
+    void sendClip(const QString &action);
     void sendScroll(double nx, double ny, double vertical);
     void handlePreviewEvent(const ScreenInputView::Event &ev);
     void updateVideoStats();
@@ -84,11 +104,14 @@ private:
     void scheduleDialogFit();
 
     ScreenInputView *m_preview = nullptr;
+    QLabel *m_offlineBanner = nullptr;
     QLabel *m_stats = nullptr;
     QTimer *m_stallTimer = nullptr;
     QTimer *m_reattachTimer = nullptr;
     QTimer *m_rateTimer = nullptr;
     QTimer *m_sessionLimitTimer = nullptr;
+    // Sends the last position the rate limit held back, once the mouse pauses.
+    QTimer *m_cursorFlushTimer = nullptr;
     qint64 m_sessionStartedAt = 0;
     bool m_sessionClosed = false;
     QString m_agentId;
@@ -104,6 +127,14 @@ private:
     bool m_disconnected = false;
     bool m_pressed = false;
     qint64 m_lastTouchTick = 0;
+    qint64 m_lastCursorTick = 0;
+    double m_lastCursorX = -1.0;
+    double m_lastCursorY = -1.0;
+    bool m_cursorShown = false;
+    // Newest position the rate limit refused to send yet.
+    double m_cursorFlushX = 0.0;
+    double m_cursorFlushY = 0.0;
+    bool m_cursorFlushPending = false;
     bool m_adjustPosted = false;
 
     // Rates measured over the last sampling window, so the label separates "frames

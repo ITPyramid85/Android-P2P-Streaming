@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import com.genymobile.scrcpy.agent.AgentInput
 import com.genymobile.scrcpy.agent.AgentInputService
 import com.screencapture.app.remote.RemoteScreenService
 import com.screencapture.app.screencapture.MediaProjectionHelper
@@ -28,6 +29,7 @@ class CaptureConsentActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SystemBars.apply(window)
         // Proof to launch() that the platform really let this activity through.
         liveInstances.incrementAndGet()
         cancelConsentNotification(applicationContext)
@@ -38,17 +40,25 @@ class CaptureConsentActivity : Activity() {
         // Already capturing with a live projection — nothing to ask. Finishing
         // immediately prevents the post-reboot launch storm from stacking cast
         // dialogs over a live stream.
-        if (ProjectionResultHolder.isReady()) {
-            RemoteScreenService.start(applicationContext)
+        if (ProjectionResultHolder.isReady() || ProjectionResultHolder.canCaptureWithoutDialog()) {
+            AppSession.goOnline(applicationContext)
+            openAccessibilityIfNeeded()
             finishSoon(200)
             return
         }
-        if (ProjectionResultHolder.canCaptureWithoutDialog()) {
-            RemoteScreenService.start(applicationContext)
-            waitUntilReadyThenFinish()
-            return
-        }
         requestCast()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        SystemBars.apply(window)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            SystemBars.apply(window)
+        }
     }
 
     private fun requestCast() {
@@ -74,9 +84,10 @@ class CaptureConsentActivity : Activity() {
         AgentInputService.disarmConsentAutoAccept()
         if (requestCode == REQ_CAPTURE && MediaProjectionHelper.isPermissionGranted(resultCode, data)) {
             ProjectionResultHolder.set(resultCode, data!!, this)
-            RemoteScreenService.start(applicationContext)
+            AppSession.goOnline(applicationContext)
             waitUntilReadyThenFinish()
         } else {
+            ServerConfig.setStoppedByHost(this, true)
             askedCast = false
             finishSoon(200)
         }
@@ -104,6 +115,7 @@ class CaptureConsentActivity : Activity() {
                 // A live projection is success. A merely-"live" streamer without a
                 // projection is stale, not success, so don't count isCapturingLive.
                 if (ProjectionResultHolder.isReady()) {
+                    openAccessibilityIfNeeded()
                     finishSoon(400)
                     return
                 }
@@ -124,6 +136,13 @@ class CaptureConsentActivity : Activity() {
             }
         }
         mainHandler.post(poll)
+    }
+
+    private fun openAccessibilityIfNeeded() {
+        if (AgentInputService.get() != null || isFinishing) {
+            return
+        }
+        AgentInput.openAccessibilitySettings(this)
     }
 
     private fun finishSoon(delayMs: Long = 1500) {

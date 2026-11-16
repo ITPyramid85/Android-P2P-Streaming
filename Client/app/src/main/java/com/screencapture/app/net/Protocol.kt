@@ -50,7 +50,19 @@ object Protocol {
     const val KEY_HOME = "home"
     const val KEY_RECENTS = "recents"
 
-    fun registerJson(id: String, device: String, model: String, os: String): String {
+    /**
+     * [shareId] names this run of sharing, not this socket. It stays the same across
+     * reconnects and changes only when the user starts sharing again, which is how
+     * the relay tells a dropped connection apart from a genuine new offer — the
+     * former resumes the session, the latter earns a fresh hour.
+     */
+    fun registerJson(
+        id: String,
+        device: String,
+        model: String,
+        os: String,
+        shareId: String
+    ): String {
         return JSONObject()
             .put("type", "register")
             .put("id", id)
@@ -58,6 +70,7 @@ object Protocol {
             .put("device", device)
             .put("model", model)
             .put("os", os)
+            .put("shareId", shareId)
             .toString()
     }
 

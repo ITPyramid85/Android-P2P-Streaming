@@ -1,6 +1,7 @@
 #include "ScreenInputView.h"
 
 #include <QColor>
+#include <QEvent>
 #include <QFont>
 #include <QGuiApplication>
 #include <QImage>
@@ -291,17 +292,29 @@ void ScreenInputView::mousePressEvent(QMouseEvent *event)
 
 void ScreenInputView::mouseDoubleClickEvent(QMouseEvent *event)
 {
-    if (event) {
-        event->accept();
+    if (!event) {
+        return;
     }
+    // Qt delivers this instead of mousePressEvent for the second press, so a
+    // double-click was one tap and then a release with no matching down.
+    setFocus(Qt::MouseFocusReason);
+    emitEvent(Kind::Press, event->pos(), event->button());
+    event->accept();
 }
 
 void ScreenInputView::mouseMoveEvent(QMouseEvent *event)
 {
-    if (event->buttons() != Qt::NoButton) {
-        emitEvent(Kind::Move, event->pos(), event->button());
+    if (!event) {
+        return;
     }
+    emitEvent(Kind::Move, event->pos(), event->button());
     event->accept();
+}
+
+void ScreenInputView::leaveEvent(QEvent *event)
+{
+    emitEvent(Kind::Leave, QPoint(), Qt::NoButton);
+    QWidget::leaveEvent(event);
 }
 
 void ScreenInputView::mouseReleaseEvent(QMouseEvent *event)

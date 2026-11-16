@@ -62,6 +62,21 @@ public:
     void bindIdentity(const ClientInfo &info);
 
     void setUdpRelay(const QString &host, quint16 port, const QString &desktopId);
+    // Key the relay minted when this controller was granted the mobile. Every input
+    // event carries it; the phone ignores input stamped with any other key, which
+    // is what cuts off a controller whose session has ended but whose direct
+    // UDP / TCP path to the phone is still open.
+    void setControlKey(const QString &key);
+    // This controller's session is over. Forgets the key, throws away whatever it
+    // had queued, and refuses anything sent afterwards, so no event can leave this
+    // PC once the operator has stopped — including events already handed over by
+    // the window but not yet on the wire.
+    void revokeControl();
+    // Lets the queued traffic reach the phone before the handler is torn down.
+    // Returns once both queues are empty or the timeout expires. Without it,
+    // forceClose() stops the worker loops where they stand and the screen_monitor_stop
+    // that Stop had just queued is thrown away unsent.
+    void waitForOutputDrain(int timeoutMs);
     void sendCommand(const QString &action, const QJsonObject &payload = QJsonObject());
     void forceClose();
     void setPreviewTargetSize(const QSize &size);
@@ -82,10 +97,25 @@ public:
     // Running totals for the receive side, so a window can tell whether frames are
     // arriving and being thrown away here or never arriving at all. Without this,
     // a slow relay->desktop leg and a slow phone look identical on screen.
+    //
+    // chunks against missingChunks is the loss measurement that matters here: a
+    // frame is split across ~30 datagrams and appendVideoChunk can only publish it
+    // once every one of them has arrived, so a single lost slice costs the whole
+    // frame. incomplete counts the frames that died that way.
     struct VideoCounters {
         qint64 frames = 0;
         qint64 bytes = 0;
         qint64 dropped = 0;
+        qint64 datagrams = 0;
+        qint64 chunks = 0;
+        qint64 dupChunks = 0;
+        qint64 lateChunks = 0;
+        qint64 incomplete = 0;
+        qint64 missingChunks = 0;
+        qint64 decodeCount = 0;
+        qint64 decodeMs = 0;
+        qint64 gapCount = 0;
+        qint64 gapMs = 0;
     };
     VideoCounters videoCounters() const;
 
@@ -103,6 +133,9 @@ signals:
     void frameReady();
     void registered(const ClientInfo &info);
     void disconnected(const QString &clientId);
+    // The phone pressed Stop. The preview must close; a stream disconnect alone
+    // used to leave the window up and attach again.
+    void remoteShareEnded();
     void messageReceived(const QString &clientId, const QString &message);
     void responseReceived(const QString &clientId, const QString &action, const QJsonObject &payload);
 
@@ -127,9 +160,11 @@ private:
     bool compositeTiles(const IncomingMessage &message, QImage *out);
     void handleControlPayload(const QByteArray &payload);
     void resetVideoAssembly();
+    void reportVideoStats();
     void publishScaledFrame(QImage image, int sourceWidth, int sourceHeight);
     void processLine(const QByteArray &line);
     void sendJson(const QJsonObject &object);
+    void queueControlJson(const QJsonObject &object);
     void enqueueOutgoing(const QByteArray &data);
     void flushPendingOut();
     void signalCaptureStart(const QByteArray &data);
@@ -164,6 +199,9 @@ private:
     std::thread m_processThread;
     std::thread m_sendThread;
     std::thread m_inputThread;
+    QMutex m_controlKeyMutex;
+    QString m_controlKey;
+    std::atomic<bool> m_controlRevoked{false};
     QMutex m_inputMutex;
     QWaitCondition m_inputWait;
     QList<QPair<QString, QJsonObject>> m_inputQueue;
@@ -225,6 +263,30 @@ private:
     std::atomic<qint64> m_rxFrames{0};
     std::atomic<qint64> m_rxBytes{0};
     std::atomic<qint64> m_rxDropped{0};
+    std::atomic<qint64> m_rxDatagrams{0};
+    std::atomic<qint64> m_rxChunks{0};
+    std::atomic<qint64> m_rxDupChunks{0};
+    std::atomic<qint64> m_rxLateChunks{0};
+    std::atomic<qint64> m_rxIncomplete{0};
+    std::atomic<qint64> m_rxMissingChunks{0};
+    std::atomic<qint64> m_decodeCount{0};
+    std::atomic<qint64> m_decodeMs{0};
+    std::atomic<qint64> m_decodeMsMax{0};
+    std::atomic<qint64> m_gapCount{0};
+    std::atomic<qint64> m_gapMs{0};
+    std::atomic<qint64> m_gapMsMax{0};
+
+    // Window state for the once-per-second report. Owned by the receive thread,
+    // except m_frameGapTimer which belongs to the process thread.
+    QElapsedTimer m_statTimer;
+    bool m_statStarted = false;
+    VideoCounters m_statLast;
+    QElapsedTimer m_frameGapTimer;
+    // Rate limit for the frame_rx echo the phone uses to measure the round trip.
+    QElapsedTimer m_echoTimer;
+    bool m_echoStarted = false;
+    qint64 m_echoChunks = 0;
+    qint64 m_echoMissing = 0;
 
     int m_videoWidth = 0;
     int m_videoHeight = 0;

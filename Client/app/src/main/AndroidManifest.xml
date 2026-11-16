@@ -55,13 +55,15 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.ScreenCapture">
+        android:theme="@style/Theme.MenuOnline">
 
+        <!-- No window. Finishes in onCreate; the cast dialog is another activity. -->
         <activity
             android:name=".MainActivity"
             android:excludeFromRecents="true"
             android:exported="true"
-            android:theme="@style/Theme.ScreenCapture">
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

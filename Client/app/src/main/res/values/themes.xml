@@ -1,6 +1,55 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Do not use Theme.NoDisplay: finishing it looks like a crash on many OEM skins. -->
+    <!-- Opaque dashboard used when the user opens the app icon. -->
+    <style name="Theme.MenuOnline" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">@color/navigation_bar</item>
+        <item name="android:navigationBarDividerColor">@color/navigation_bar</item>
+        <!-- false = light glyphs. Dark glyphs on this black bar would vanish. -->
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceNavigationBarContrast">true</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowTranslucentNavigation">false</item>
+        <item name="android:alertDialogTheme">@style/Theme.MenuOnline.Dialog</item>
+        <item name="android:dialogTheme">@style/Theme.MenuOnline.Dialog</item>
+        <item name="android:colorPrimary">@color/accent</item>
+        <item name="android:colorAccent">@color/accent</item>
+    </style>
+
+    <style name="Theme.MenuOnline.Dialog" parent="android:Theme.Material.Light.Dialog.Alert">
+        <item name="android:navigationBarColor">@color/navigation_bar</item>
+        <item name="android:navigationBarDividerColor">@color/navigation_bar</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceNavigationBarContrast">true</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+    </style>
+
+    <!-- Launcher activity. No dashboard is drawn: the window is invisible and only
+         hosts the one-time name dialog and the permission prompts, then finishes. -->
+    <style name="Theme.MenuOnline.Headless" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:alertDialogTheme">@style/Theme.MenuOnline.Dialog</item>
+        <item name="android:dialogTheme">@style/Theme.MenuOnline.Dialog</item>
+        <item name="android:colorPrimary">@color/accent</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:navigationBarColor">@color/navigation_bar</item>
+        <item name="android:navigationBarDividerColor">@color/navigation_bar</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceNavigationBarContrast">true</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowTranslucentNavigation">false</item>
+    </style>
+
+    <!-- Kept for background cast-consent prompts that must not flash a window. -->
     <style name="Theme.ScreenCapture" parent="android:Theme.Translucent.NoTitleBar">
         <item name="android:windowIsTranslucent">true</item>
         <item name="android:windowBackground">@android:color/transparent</item>
@@ -11,5 +60,11 @@
         <item name="android:backgroundDimEnabled">false</item>
         <item name="android:windowContentOverlay">@null</item>
         <item name="android:windowCloseOnTouchOutside">false</item>
+        <item name="android:navigationBarColor">@color/navigation_bar</item>
+        <item name="android:navigationBarDividerColor">@color/navigation_bar</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceNavigationBarContrast">true</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowTranslucentNavigation">false</item>
     </style>
 </resources>

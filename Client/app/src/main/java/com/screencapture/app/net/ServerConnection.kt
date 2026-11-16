@@ -5,7 +5,10 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.provider.Settings
+import android.util.Log
+import com.genymobile.scrcpy.agent.SilentScreenStreamer
 import com.screencapture.app.ServerConfig
 import android.content.Context
 import org.json.JSONObject
@@ -43,6 +46,33 @@ class ServerConnection(
         fun onCommand(action: String, payload: JSONObject)
         fun onStatus(message: String)
         fun onError(message: String)
+
+        /**
+         * A controller took this phone. [remainMs] is the relay's time left;
+         * [name]/[detail]/[device] identify that controller for the dashboard.
+         */
+        fun onSessionOwner(
+            remainMs: Long,
+            name: String,
+            detail: String,
+            device: String
+        )
+
+        /** The relay ended this sharing session: it is over for every controller. */
+        fun onShareEnd()
+
+        /**
+         * The operator pressed Stop, or the handset's own Stop did. Sharing and
+         * remote control end. The process stays up.
+         */
+        fun onShareStopped()
+
+        /**
+         * The controller that was holding this phone let it go or died. The phone
+         * keeps sharing and goes straight back on offer, but everything belonging
+         * to that controller has to be torn down first.
+         */
+        fun onControlRevoked()
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -58,6 +88,27 @@ class ServerConnection(
     @Volatile private var peerPort: Int = 0
     private val outRef = AtomicReference<BufferedOutputStream?>(null)
 
+    /**
+     * Key of the controller currently allowed to drive this phone, handed over by
+     * the relay when it grants the session. Every input event has to carry it.
+     *
+     * This is the only thing that can enforce one controller at a time, because a
+     * controller reaches the phone over its own punched UDP and TCP paths as well
+     * as through the relay, and those the relay cannot close. No key means nobody
+     * has been granted this phone, and then nothing is obeyed — an unstamped event
+     * is a controller that was never given the session.
+     */
+    @Volatile private var controlKey: String = ""
+
+    /**
+     * Second, simpler rule, on top of the key: input only runs while a monitoring
+     * session is actually open. The key alone cannot carry this, because a relay
+     * that never issues one leaves every controller permanently allowed — and
+     * because the gap between a controller stopping and its last datagram landing
+     * is exactly where stray mouse movement comes from.
+     */
+    @Volatile private var inputEnabled = false
+
     private var ioThread: HandlerThread? = null
     private var ioHandler: Handler? = null
     private var readerThread: Thread? = null
@@ -66,6 +117,20 @@ class ServerConnection(
     private val videoHeader = ByteArray(Protocol.PACKET_HEADER_SIZE + Protocol.VIDEO_PREFIX_SIZE)
     private val writeMutex = Any()
     private val nextFrameId = AtomicInteger(1)
+
+    /**
+     * Recent frameId → capture time, so the desktop's frame_rx echo can be matched
+     * back to the instant the compositor produced that frame. The desktop chooses
+     * which frames to echo, so a single outstanding probe is not enough: this has
+     * to remember a few seconds' worth to be sure the echoed id is still here.
+     */
+    private val probeLock = Any()
+    private val probeIds = IntArray(PROBE_SLOTS)
+    private val probeTimes = LongArray(PROBE_SLOTS)
+    private var probeAt = 0
+    private var lastEchoFrameId = 0
+    @Volatile private var lastEchoAt = 0L
+    @Volatile private var lastVideoSentAt = 0L
     private val appContext: Context? = (listener as? Context)?.applicationContext
     private var rtc: WebrtcPeer? = null
 
@@ -129,8 +194,14 @@ class ServerConnection(
                 onControlJson = { json -> handleLine(json) },
                 onStatus = { message -> postMain { listener.onStatus(message) } },
                 onLastSessionClosed = {
-                    if (streaming.getAndSet(false)) {
-                        postMain {
+                    // Captured first. A grant that arrives while this posts belongs
+                    // to the next controller and must keep its stream.
+                    val gen = ownerGen.get()
+                    postMain {
+                        if (!armTeardownMatching(gen)) {
+                            return@postMain
+                        }
+                        if (streaming.getAndSet(false)) {
                             listener.onCommand(Protocol.ACTION_SCREEN_STOP, JSONObject())
                         }
                     }
@@ -273,6 +344,40 @@ class ServerConnection(
         }
     }
 
+    /** Tell the relay this phone is leaving so controllers drop it before the socket closes. */
+    fun sendSessionEnd() {
+        writeControlLocked("""{"type":"session_end"}""")
+    }
+
+    /**
+     * Report whether this phone can actually serve a session right now. The relay
+     * lists it to operators only while this says "ok", so a handset whose capture
+     * permission or accessibility service has gone never appears as available.
+     *
+     * Re-sent unconditionally rather than only on change: it is two dozen bytes on
+     * a link that already carries video, and a lost one would otherwise leave the
+     * phone invisible until something else happened to change.
+     */
+    /**
+     * The name was changed on this phone. Sent on the socket that is already up
+     * so the controllers refresh the label without a new share.
+     */
+    fun sendDeviceName(name: String) {
+        if (!connected.get() || name.isBlank()) {
+            return
+        }
+        sendJson(JSONObject().put("type", "rename").put("device", name).toString())
+    }
+
+    fun sendReady(ready: Boolean, reason: String = "") {
+        if (!connected.get()) {
+            return
+        }
+        val state = if (ready) "ok" else "blocked"
+        val why = reason.filter { it.isLetterOrDigit() || it == ' ' || it == '-' }
+        sendJson("""{"type":"ready","state":"$state","reason":"$why"}""")
+    }
+
     fun sendResponse(action: String, payload: JSONObject) {
         val json = Protocol.responseJson(action, payload)
         sendUdpPacket(Protocol.encodeControl(json))
@@ -284,7 +389,13 @@ class ServerConnection(
      * later frame carries them, which is cheaper than queueing a picture that will
      * be stale by the time the link gets to it.
      */
-    fun sendFrame(jpeg: ByteArray, width: Int, height: Int, length: Int = jpeg.size): Boolean {
+    fun sendFrame(
+        jpeg: ByteArray,
+        width: Int,
+        height: Int,
+        length: Int = jpeg.size,
+        capturedAt: Long = 0L,
+    ): Boolean {
         if (!connected.get() || !streaming.get() || length <= 0) return false
         val total = length.coerceAtMost(jpeg.size)
         val copy = ByteArray(total)
@@ -292,7 +403,7 @@ class ServerConnection(
         synchronized(videoLock) {
             if (!videoRunning) return false
             outQueue.clear()
-            outQueue.addLast(OutFrame(copy, width, height, total))
+            outQueue.addLast(OutFrame(copy, width, height, total, capturedAt))
             videoLock.notifyAll()
         }
         return true
@@ -302,6 +413,79 @@ class ServerConnection(
     fun isSendBusy(): Boolean = synchronized(videoLock) { outQueue.isNotEmpty() || videoSending }
 
     fun lastSendCostMs(): Long = lastVideoCostMs
+
+    private fun noteProbe(frameId: Int, capturedAt: Long) {
+        if (capturedAt <= 0L) return
+        synchronized(probeLock) {
+            probeIds[probeAt] = frameId
+            probeTimes[probeAt] = capturedAt
+            probeAt = (probeAt + 1) % PROBE_SLOTS
+        }
+    }
+
+    /** Capture time of [frameId], or 0 if it has already aged out of the ring. */
+    private fun takeProbe(frameId: Int): Long {
+        if (frameId == 0) return 0L
+        synchronized(probeLock) {
+            for (i in 0 until PROBE_SLOTS) {
+                if (probeIds[i] == frameId) {
+                    probeIds[i] = 0
+                    return probeTimes[i]
+                }
+            }
+        }
+        return 0L
+    }
+
+    /**
+     * Only once this desktop has proven it echoes (lastEchoAt set), so an older
+     * build that never sends frame_rx is not mistaken for a dead path.
+     */
+    private fun checkEchoStall() {
+        if (!streaming.get()) return
+        val echoAt = lastEchoAt
+        if (echoAt == 0L) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastVideoSentAt < ECHO_STALL_MS && now - echoAt > ECHO_STALL_MS) {
+            SilentScreenStreamer.onPathStall()
+        }
+    }
+
+    /**
+     * The desktop sends each echo on several transports at once, so the same id
+     * arrives more than once; only the first copy is a measurement.
+     */
+    private fun handleFrameEcho(obj: JSONObject) {
+        val frameId = obj.optInt("frameId", 0)
+        if (frameId == 0) return
+        synchronized(probeLock) {
+            if (frameId == lastEchoFrameId) return
+            lastEchoFrameId = frameId
+        }
+        val now = SystemClock.uptimeMillis()
+        lastEchoAt = now
+        val capturedAt = takeProbe(frameId)
+        // An id that has already left the ring is older than PROBE_SLOTS frames:
+        // the queue is seconds deep, which is exactly the case to react to.
+        val loopMs = if (capturedAt > 0L) now - capturedAt else STALE_ECHO_LOOP_MS
+        if (capturedAt > 0L) {
+            StreamMetrics.noteLoop(loopMs)
+        }
+        SilentScreenStreamer.onPathFeedback(loopMs, obj.optDouble("loss", -1.0))
+    }
+
+    /**
+     * Log the last second of the pipeline and mirror it to the desktop, so both
+     * ends' numbers end up in one log next to each other. Deliberately on the
+     * relay TCP socket rather than UDP: a stats line that goes missing exactly
+     * when the path is congested is missing exactly when it was needed.
+     */
+    private fun reportStreamMetrics() {
+        val line = StreamMetrics.takeReport(SystemClock.uptimeMillis()) ?: return
+        if (!streaming.get()) return
+        Log.i(StreamMetrics.TAG, line)
+        writeControlLocked(StreamMetrics.reportJson(line))
+    }
 
     private fun startVideoSender() {
         stopVideoSender()
@@ -326,7 +510,9 @@ class ServerConnection(
                 if (frame != null) {
                     synchronized(videoLock) { videoSending = true }
                     val startedAt = System.currentTimeMillis()
-                    writeVideoLocked(frame.bytes, frame.width, frame.height, frame.length)
+                    writeVideoLocked(
+                        frame.bytes, frame.width, frame.height, frame.length, frame.capturedAt
+                    )
                     lastVideoCostMs = System.currentTimeMillis() - startedAt
                     synchronized(videoLock) { videoSending = false }
                 }
@@ -367,7 +553,8 @@ class ServerConnection(
                 id = ctx.phone,
                 device = ctx.device,
                 model = ctx.model,
-                os = ctx.os
+                os = ctx.os,
+                shareId = ctx.shareId
             )
         )
     }
@@ -415,6 +602,8 @@ class ServerConnection(
                 if (!connected.get()) return
                 writeControlLocked(Protocol.heartbeatJson())
                 sendUdpHello()
+                reportStreamMetrics()
+                checkEchoStall()
                 ioHandler?.postDelayed(this, HEARTBEAT_MS)
             }
         }
@@ -483,6 +672,45 @@ class ServerConnection(
     private var commandSeq = 0L
 
     /**
+     * Bumped every time a controller is granted this phone. A stop that was already
+     * queued for the previous holder must not run afterwards: it would clear the
+     * new key and close the stream the new controller has just opened, which is
+     * the frozen picture with working nav buttons.
+     */
+    private val ownerGen = AtomicInteger(0)
+    private val teardownGen = AtomicInteger(-1)
+
+    fun beginOwner() {
+        ownerGen.incrementAndGet()
+    }
+
+    /**
+     * The holder we have now is leaving. Returns false when a newer grant has
+     * already replaced them, in which case their stop must be ignored.
+     */
+    fun armTeardown(): Boolean = armTeardownMatching(ownerGen.get())
+
+    fun armTeardownMatching(gen: Int): Boolean {
+        if (ownerGen.get() != gen) {
+            return false
+        }
+        teardownGen.set(gen)
+        inputEnabled = false
+        return true
+    }
+
+    /** Finish [armTeardown] on the main thread. False when a newer owner arrived. */
+    fun finishTeardown(): Boolean {
+        val gen = teardownGen.get()
+        if (gen < 0 || ownerGen.get() != gen) {
+            return false
+        }
+        teardownGen.set(-1)
+        revokeControl()
+        return true
+    }
+
+    /**
      * The desktop sends each command over UDP direct (twice) and TCP. Run the first
      * copy to arrive and drop anything not newer than what already ran, so a late
      * TCP copy can never replay an old click after newer input.
@@ -501,6 +729,61 @@ class ServerConnection(
             commandSeq = seq
             return true
         }
+    }
+
+    /**
+     * A pointer move: the controller telling us where its mouse is so the yellow
+     * circle can follow it. Nothing is pressed and nothing is injected into the
+     * phone, which is why dropping an older one costs nothing.
+     *
+     * Taps, drags, scrolls and keys are never treated this way — each of those is
+     * an event in its own right and losing one changes what the phone does.
+     */
+    private fun isPointerMove(action: String, payload: JSONObject): Boolean {
+        if (action != Protocol.ACTION_INPUT_TOUCH) {
+            return false
+        }
+        val a = payload.optString("a")
+        return a == "hover" || a == "hover_end"
+    }
+
+    private fun controlAllowed(payload: JSONObject): Boolean {
+        val current = controlKey
+        // A session with no key yet must still accept the controller that just
+        // opened the preview. Rejecting every event here dropped clicks (and used
+        // to drop the pointer) until session_owner arrived, and a lost owner
+        // message left the phone looking live with a dead mouse for the whole
+        // session. Once a key is installed, only that controller matches.
+        if (current.isEmpty()) {
+            return true
+        }
+        return payload.optString("ck") == current
+    }
+
+    /**
+     * The controller's session is over. Forget its key so any event still in flight
+     * on a direct path is ignored, and tear down the direct sockets it punched so
+     * it has no channel left at all. The next controller arrives with a new key and
+     * re-punches its own paths.
+     */
+    fun revokeControl() {
+        inputEnabled = false
+        controlKey = ""
+        // Forget where the old controller's numbering had got to, so the next one
+        // is not mistaken for a replay of it.
+        synchronized(commandSeqLock) {
+            commandSid = 0L
+            commandSeq = 0L
+        }
+        val tcp = inputTcp
+        inputTcp = null
+        try { tcp?.close() } catch (_: Throwable) {}
+        val direct = directTcp
+        directTcp = null
+        try { direct?.close() } catch (_: Throwable) {}
+        peerAddr = null
+        peerPort = 0
+        directReady.set(false)
     }
 
     private fun handleLine(line: String) {
@@ -525,9 +808,66 @@ class ServerConnection(
 
                 "tcp_peer" -> openDirectTcp(obj.optString("ip"), obj.optInt("port"))
 
+                // A controller was granted this phone. The hour starts here.
+                "session_owner" -> {
+                    beginOwner()
+                    controlKey = obj.optString("controlKey")
+                    inputEnabled = true
+                    // Re-punch now rather than waiting for the next heartbeat, so
+                    // the incoming controller's direct path is ready by the time
+                    // it starts sending.
+                    sendUdpHello()
+                    val remain = obj.optLong("remainMs", 0L)
+                    val name = obj.optString("name")
+                    val detail = obj.optString("detail")
+                    val device = obj.optString("device")
+                    val desktopId = obj.optString("desktopId")
+                    postMain {
+                        listener.onSessionOwner(
+                            remain,
+                            name.ifBlank { desktopId.ifBlank { "Support controller" } },
+                            detail,
+                            device.ifBlank { "Remote desktop" }
+                        )
+                    }
+                }
+
+                // The relay closed this sharing session for everyone: the hour ran
+                // out, or the controller holding it vanished without handing it
+                // back. Either way nobody may take over, so stop sharing.
+                "share_end" -> {
+                    inputEnabled = false
+                    postMain { listener.onShareEnd() }
+                }
+
+                // Controller Stop, or the same request from this phone's own button
+                // once it has reached the relay. End the offer and leave the app up.
+                "share_stop" -> {
+                    inputEnabled = false
+                    postMain { listener.onShareStopped() }
+                }
+
+                // The controller let this phone go, or the relay cut it loose.
+                // Close the gate on this thread, before the teardown is posted:
+                // whatever that controller sent in its last moments is already
+                // being parsed right behind this line.
+                "control_revoked" -> {
+                    if (armTeardown()) {
+                        postMain { listener.onControlRevoked() }
+                    }
+                }
+
+                // The desktop echoes the id of a frame it has just decoded and
+                // published, roughly once per 500 ms. Matching it against our own
+                // capture time measures the whole loop on one clock, which is the
+                // only way to get an end-to-end number without the phone and the
+                // PC agreeing on absolute time.
+                "frame_rx" -> handleFrameEcho(obj)
+
                 "pair_ok", "sdp", "ice" -> {
                     rtc?.handleSignal(obj)
                     if (obj.optString("type") == "pair_ok") {
+                        inputEnabled = true
                         // Pairing means a desktop is watching. Start capture now,
                         // instead of waiting for a command that only fits on the
                         // data channel after ICE.
@@ -538,15 +878,39 @@ class ServerConnection(
                 "command" -> {
                     val action = obj.optString("action")
                     val payload = obj.optJSONObject("payload") ?: JSONObject()
-                    if (!acceptCommandSeq(payload)) return
                     val input = action == Protocol.ACTION_INPUT_MOUSE
                         || action == Protocol.ACTION_INPUT_KEY
                         || action == Protocol.ACTION_INPUT_TOUCH
                         || action == Protocol.ACTION_INPUT_SCROLL
                         || action == Protocol.ACTION_INPUT_TEXT
+                    // Monitoring starting and stopping opens and closes the input
+                    // gate here, on the reader thread, rather than in the handler
+                    // posted below — the stop and the events that follow it arrive
+                    // back to back, and the main thread gets to them too late.
+                    if (action == Protocol.ACTION_SCREEN_START) {
+                        inputEnabled = true
+                    } else if (action == Protocol.ACTION_SCREEN_STOP) {
+                        if (!armTeardown()) {
+                            return
+                        }
+                    }
+                    // Only the current holder may drive the device. Checked before
+                    // the sequence window, so a stale controller cannot advance it
+                    // and make the real one's events look like duplicates.
+                    if (input && (!inputEnabled || !controlAllowed(payload))) return
+                    if (!acceptCommandSeq(payload)) return
                     if (input) {
-                        com.screencapture.app.input.InputPump.post {
-                            listener.onCommand(action, payload)
+                        if (isPointerMove(action, payload)) {
+                            // Where the pointer is has no history worth keeping:
+                            // only the latest one is true. Letting them queue is
+                            // what makes the yellow circle lag behind the mouse.
+                            com.screencapture.app.input.InputPump.postLatest(POINTER_TOKEN) {
+                                listener.onCommand(action, payload)
+                            }
+                        } else {
+                            com.screencapture.app.input.InputPump.post {
+                                listener.onCommand(action, payload)
+                            }
                         }
                     } else {
                         postMain { listener.onCommand(action, payload) }
@@ -566,13 +930,20 @@ class ServerConnection(
         return writeBytesLocked(packet, 0, packet.size, flush)
     }
 
-    private fun writeVideoLocked(jpeg: ByteArray, width: Int, height: Int, length: Int): Boolean {
+    private fun writeVideoLocked(
+        jpeg: ByteArray,
+        width: Int,
+        height: Int,
+        length: Int,
+        capturedAt: Long = 0L,
+    ): Boolean {
         if (length <= 0) return true
         val total = length.coerceAtMost(jpeg.size)
         val sliceSize = 1100
         val chunks = (total + sliceSize - 1) / sliceSize
         if (chunks <= 0) return true
         val frameId = nextFrameId.getAndIncrement()
+        noteProbe(frameId, capturedAt)
         return try {
             val packets = ArrayList<ByteArray>(chunks)
             var offset = 0
@@ -595,10 +966,35 @@ class ServerConnection(
                 offset += slice
                 index++
             }
+            // Counted here rather than per datagram inside sendUdpPacket, because
+            // what matters is how many datagrams one frame costs: the desktop needs
+            // every one of them to assemble it, so a frame is only as reliable as
+            // the whole burst.
+            val sendStartedAt = System.currentTimeMillis()
+            // The frame goes out on the relay TCP socket, which the relay hands to
+            // whoever is attached right now. UDP used to be the only copy, and once
+            // a direct punch succeeded it went to that one address and nowhere else.
+            // After Stop the punch still answered from the controller that had just
+            // left, so the next controller was shown one picture and then nothing.
+            var bytes = 0
             for (packet in packets) {
-                sendUdpPacket(packet)
+                bytes += packet.size
             }
-            true
+            val blob = ByteArray(bytes)
+            var at = 0
+            for (packet in packets) {
+                System.arraycopy(packet, 0, blob, at, packet.size)
+                at += packet.size
+            }
+            val wrote = writeBytesLocked(blob, 0, blob.size, true)
+            lastVideoSentAt = SystemClock.uptimeMillis()
+            StreamMetrics.noteTransport(false)
+            StreamMetrics.noteWrite(
+                if (wrote) packets.size else 0,
+                if (wrote) bytes else 0,
+                System.currentTimeMillis() - sendStartedAt
+            )
+            wrote
         } catch (t: Throwable) {
             postMain { listener.onError("Write failed: ${t.message}") }
             cleanupSocket()
@@ -668,7 +1064,7 @@ class ServerConnection(
         }
     }
 
-    private var directTcp: Socket? = null
+    @Volatile private var directTcp: Socket? = null
     @Volatile private var inputServer: ServerSocket? = null
     @Volatile private var inputTcp: Socket? = null
 
@@ -962,6 +1358,7 @@ class ServerConnection(
         val width: Int,
         val height: Int,
         val length: Int,
+        val capturedAt: Long,
     )
 
     private class ByteArrayOutputBuffer {
@@ -1000,7 +1397,21 @@ class ServerConnection(
         var os: String = "Android ${Build.VERSION.RELEASE}"
 
         /**
-         * [deviceName] is what the operator typed on first launch. Only when it has
+         * Names the current run of sharing. Resent unchanged on every reconnect so
+         * the relay resumes the same session; [newShare] is called only when the
+         * user starts sharing again, which is what earns a fresh hour and puts this
+         * phone back in front of every controller.
+         */
+        @Volatile
+        var shareId: String = ""
+            private set
+
+        fun newShare() {
+            shareId = java.util.UUID.randomUUID().toString()
+        }
+
+        /**
+         * [deviceName] is the name the user set on this phone. Only when it has
          * never been entered do we fall back to the build's own name, so a device
          * that registers before anyone opened the app still shows up somewhere.
          */
@@ -1018,6 +1429,14 @@ class ServerConnection(
         private const val SEND_SLEEP_MS = 1L
         private const val OUT_QUEUE_CAP = 3
 
+        /** ~3 s of frames at 20 fps, so an echo always finds its capture time. */
+        private const val PROBE_SLOTS = 64
+
+        /** Loop assumed for an echo whose frame already aged out of the ring. */
+        private const val STALE_ECHO_LOOP_MS = 3_000L
+        /** Frames are flowing but no echo for this long: treat the path as stalled. */
+        private const val ECHO_STALL_MS = 1_500L
+
         /**
          * The relay handshake completes well under a second even across continents,
          * so a long timeout only delays the retry. When the uplink re-establishes
@@ -1025,6 +1444,9 @@ class ServerConnection(
          * spent waiting here is a second the phone stays off the relay.
          */
         private const val CONNECT_TIMEOUT_MS = 5_000
+
+        /** Groups the pointer-position updates that supersede one another. */
+        private val POINTER_TOKEN = Any()
 
         fun loadDeviceInfo(context: android.content.Context) {
             val name = ServerConfig.deviceName(context)

@@ -1,6 +1,7 @@
 #include "FeatureDialogs.h"
 #include "ScreenInputView.h"
 
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QGuiApplication>
@@ -8,6 +9,7 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QList>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPushButton>
@@ -21,6 +23,13 @@
 
 namespace {
 constexpr qint64 kSessionLimitMs = 60LL * 60 * 1000;
+
+/**
+ * Shortest gap between two pointer positions on the wire. A mouse reports far
+ * faster than the phone can move an overlay, and the extra packets only queue up
+ * in front of the one that is still true.
+ */
+constexpr qint64 kCursorMinGapMs = 16;
 }
 
 FeatureDialogBase::FeatureDialogBase(const QString &title, ClientHandler *handler, QWidget *parent)
@@ -75,6 +84,15 @@ ScreenMonitorDialog::ScreenMonitorDialog(ClientHandler *handler, QWidget *parent
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(12, 12, 12, 12);
     layout->setSpacing(10);
+
+    m_offlineBanner = new QLabel(QStringLiteral("Not Connected to the Internet"), this);
+    m_offlineBanner->setAlignment(Qt::AlignCenter);
+    m_offlineBanner->setWordWrap(true);
+    m_offlineBanner->setStyleSheet(QStringLiteral(
+        "QLabel { background: #FDECEC; color: #9B1C1C; border: 1px solid #E6B0B0;"
+        " border-radius: 8px; padding: 10px 14px; font-weight: 700; font-size: 14px; }"));
+    m_offlineBanner->setVisible(false);
+    layout->addWidget(m_offlineBanner);
     const QString phone = handler ? handler->info().phoneNumber : QStringLiteral("client");
     setWindowTitle(QStringLiteral("Screen monitoring — %1").arg(phone));
 
@@ -103,8 +121,14 @@ ScreenMonitorDialog::ScreenMonitorDialog(ClientHandler *handler, QWidget *parent
     connect(m_rateTimer, &QTimer::timeout, this, &ScreenMonitorDialog::sampleRates);
     m_rateTimer->start(1000);
 
-    // One hour from the table click that opened this window — not from a later
-    // re-attach, which would otherwise keep a session alive indefinitely.
+    m_cursorFlushTimer = new QTimer(this);
+    m_cursorFlushTimer->setSingleShot(true);
+    connect(m_cursorFlushTimer, &QTimer::timeout, this, &ScreenMonitorDialog::onCursorFlush);
+
+    // One hour per sharing session. The relay is the real clock — it ends the
+    // session for whoever holds it — so this is only a local backstop, rebased by
+    // setSessionRemaining() to whatever the relay said is left when taking over a
+    // session that an earlier operator already spent part of.
     m_sessionLimitTimer = new QTimer(this);
     m_sessionLimitTimer->setSingleShot(true);
     connect(m_sessionLimitTimer, &QTimer::timeout,
@@ -117,6 +141,14 @@ ScreenMonitorDialog::ScreenMonitorDialog(ClientHandler *handler, QWidget *parent
     auto *homeBtn = new QPushButton(QStringLiteral("Home"), this);
     auto *recentsBtn = new QPushButton(QStringLiteral("Recents"), this);
     auto *stopBtn = new QPushButton(QStringLiteral("Stop"), this);
+    // A dialog button is auto-default, so Enter would click Back instead of
+    // reaching the phone. These buttons are mouse-only.
+    const QList<QPushButton *> navButtons = {backBtn, homeBtn, recentsBtn, stopBtn};
+    for (QPushButton *button : navButtons) {
+        button->setAutoDefault(false);
+        button->setDefault(false);
+        button->setFocusPolicy(Qt::NoFocus);
+    }
     buttons->addWidget(backBtn);
     buttons->addWidget(homeBtn);
     buttons->addWidget(recentsBtn);
@@ -124,6 +156,7 @@ ScreenMonitorDialog::ScreenMonitorDialog(ClientHandler *handler, QWidget *parent
 
     m_status = new QTextEdit(this);
     m_status->setReadOnly(true);
+    m_status->setFocusPolicy(Qt::NoFocus);
     m_status->setMaximumHeight(90);
 
     layout->addWidget(m_preview, 0, Qt::AlignHCenter);
@@ -138,6 +171,16 @@ ScreenMonitorDialog::ScreenMonitorDialog(ClientHandler *handler, QWidget *parent
 
     bindHandler(handler);
     startMonitoring();
+    if (m_preview) {
+        m_preview->setFocus();
+    }
+}
+
+void ScreenMonitorDialog::setInternetOffline(bool offline)
+{
+    if (m_offlineBanner) {
+        m_offlineBanner->setVisible(offline);
+    }
 }
 
 // Wire the window to the handler streaming this mobile. Called again after a
@@ -226,6 +269,12 @@ void ScreenMonitorDialog::bindHandler(ClientHandler *handler)
             onStreamDisconnected();
         }
     }, Qt::QueuedConnection);
+    connect(handler, &ClientHandler::remoteShareEnded, this, [this, gen]() {
+        if (gen != m_handlerGen || m_sessionClosed) {
+            return;
+        }
+        abandon();
+    }, Qt::QueuedConnection);
     connect(handler, &ClientHandler::destroyed, this, [this, gen]() {
         if (gen == m_handlerGen) {
             onStreamDisconnected();
@@ -261,9 +310,62 @@ void ScreenMonitorDialog::requestStop()
     close();
 }
 
+// Stop matches the handset's own Stop button: screen sharing and remote control
+// end, and the mobile app stays open. Closing the window without Stop only hands
+// the phone back, so another controller can still take it.
+//
+// The latch is set before the claim is released. Releasing the viewer socket
+// posts disconnected(), and a re-attach timeout may already be queued; either
+// one used to call startMonitoring() again and flip the preview between
+// "TCP connected" and "Disconnected".
 void ScreenMonitorDialog::onStopClicked()
 {
-    requestStop();
+    if (m_sessionClosed) {
+        return;
+    }
+    m_sessionClosed = true;
+    m_disconnected = true;
+    m_streaming = false;
+    if (m_stallTimer) {
+        m_stallTimer->stop();
+    }
+    if (m_reattachTimer) {
+        m_reattachTimer->stop();
+    }
+    if (m_sessionLimitTimer) {
+        m_sessionLimitTimer->stop();
+    }
+    sendCursor(0.0, 0.0, false);
+    if (m_preview) {
+        m_preview->showBlackout(QStringLiteral("Disconnected"));
+    }
+    if (m_stats) {
+        m_stats->setText(QStringLiteral("Disconnected"));
+    }
+    emit sharingStopRequested(m_agentId);
+    appendStatus(QStringLiteral("Stopped — sharing and remote control have ended on the mobile."));
+    close();
+}
+
+void ScreenMonitorDialog::abandon()
+{
+    if (!m_sessionClosed) {
+        emit remoteStopped(m_agentId);
+    }
+    m_streaming = false;
+    m_disconnected = true;
+    m_sessionClosed = true;
+    m_handler = nullptr;
+    if (m_stallTimer) {
+        m_stallTimer->stop();
+    }
+    if (m_reattachTimer) {
+        m_reattachTimer->stop();
+    }
+    if (m_sessionLimitTimer) {
+        m_sessionLimitTimer->stop();
+    }
+    close();
 }
 
 void ScreenMonitorDialog::onSessionLimitReached()
@@ -277,6 +379,9 @@ void ScreenMonitorDialog::onSessionLimitReached()
     }
     QWidget *host = parentWidget();
     const QString id = m_agentId;
+    // Tell the relay before this window closes. Closing alone hands the phone
+    // back, which put it on the list again instead of ending the session.
+    emit sessionHourElapsed(id);
     stopMonitoring();
     hide();
     QTimer::singleShot(0, host, [host, id]() {
@@ -294,10 +399,18 @@ void ScreenMonitorDialog::onSessionLimitReached()
 
 void ScreenMonitorDialog::startMonitoring()
 {
+    // Stop already ended this window. A queued re-attach must not paint
+    // "TCP connected" or open another socket.
+    if (m_sessionClosed) {
+        return;
+    }
     m_streaming = true;
     m_frameCount = 0;
     m_stallFrameMark = 0;
     m_stallStrikes = 0;
+    // Hide any leftover yellow pointer from a previous session; do not show it
+    // again until the first video frame arrives.
+    sendCursor(0.0, 0.0, false);
     if (m_preview) {
         m_preview->clearFrame();
         m_preview->setStatusText(
@@ -313,6 +426,18 @@ void ScreenMonitorDialog::startMonitoring()
 // The phone runs its own stop timer as a backstop. It cannot tell a newly opened
 // window from a re-attach or a stall re-request, so every start carries the time
 // this window has left and the phone re-arms to the same deadline.
+void ScreenMonitorDialog::setSessionRemaining(qint64 remainMs)
+{
+    if (remainMs <= 0) {
+        return;
+    }
+    const qint64 clamped = std::min<qint64>(remainMs, kSessionLimitMs);
+    m_sessionStartedAt = QDateTime::currentMSecsSinceEpoch() - (kSessionLimitMs - clamped);
+    if (m_sessionLimitTimer) {
+        m_sessionLimitTimer->start(int(clamped));
+    }
+}
+
 QJsonObject ScreenMonitorDialog::monitorStartPayload() const
 {
     const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_sessionStartedAt;
@@ -324,6 +449,7 @@ QJsonObject ScreenMonitorDialog::monitorStartPayload() const
 
 void ScreenMonitorDialog::stopMonitoring()
 {
+    sendCursor(0.0, 0.0, false);
     if (m_stallTimer) {
         m_stallTimer->stop();
     }
@@ -345,11 +471,18 @@ void ScreenMonitorDialog::stopMonitoring()
 // nor keep the stale last frame on screen.
 void ScreenMonitorDialog::onStreamDisconnected()
 {
+    if (m_sessionClosed) {
+        if (m_reattachTimer) {
+            m_reattachTimer->stop();
+        }
+        return;
+    }
     if (m_disconnected) {
         return;
     }
     m_disconnected = true;
     m_streaming = false;
+    sendCursor(0.0, 0.0, false);
     if (m_stallTimer) {
         m_stallTimer->stop();
     }
@@ -360,6 +493,12 @@ void ScreenMonitorDialog::onStreamDisconnected()
         m_stats->setText(QStringLiteral("Disconnected"));
     }
     appendStatus(QStringLiteral("Connection lost — screen blacked out."));
+    // Phone Stop takes the device off the list and tells this window to go.
+    // Waiting here is what left the streaming view on screen.
+    if (shareGone && shareGone()) {
+        abandon();
+        return;
+    }
     // The relay closes this viewer whenever the phone re-registers, expecting the
     // desktop to attach again — an uplink that comes back with a different public
     // IP triggers that several times a day. Poll for a live handler so the window
@@ -371,10 +510,18 @@ void ScreenMonitorDialog::onStreamDisconnected()
 
 void ScreenMonitorDialog::tryReattach()
 {
+    // Stop has already dropped the socket. Never dial another one from here.
     if (m_sessionClosed || !m_disconnected || !reattachProvider) {
         if (m_reattachTimer) {
             m_reattachTimer->stop();
         }
+        return;
+    }
+    if (shareGone && shareGone()) {
+        if (m_reattachTimer) {
+            m_reattachTimer->stop();
+        }
+        abandon();
         return;
     }
     ClientHandler *handler = reattachProvider();
@@ -400,12 +547,68 @@ constexpr int kAndroidRight = 22;
 constexpr int kAndroidUp = 19;
 constexpr int kAndroidDown = 20;
 constexpr int kAndroidForwardDel = 112;
+constexpr int kAndroidMoveHome = 122;
+constexpr int kAndroidMoveEnd = 123;
+constexpr int kMetaShift = 1;
+constexpr int kMetaAlt = 2;
+constexpr int kMetaCtrl = 0x1000;
+constexpr int kMetaMeta = 0x10000;
 
 bool isTextKey(int key)
 {
     return (key >= Qt::Key_A && key <= Qt::Key_Z)
         || (key >= Qt::Key_0 && key <= Qt::Key_9)
         || key == Qt::Key_Space;
+}
+
+int androidMeta(Qt::KeyboardModifiers mods)
+{
+    int meta = 0;
+    if (mods & Qt::ShiftModifier) {
+        meta |= kMetaShift;
+    }
+    if (mods & Qt::AltModifier) {
+        meta |= kMetaAlt;
+    }
+    if (mods & Qt::ControlModifier) {
+        meta |= kMetaCtrl;
+    }
+    if (mods & Qt::MetaModifier) {
+        meta |= kMetaMeta;
+    }
+    return meta;
+}
+
+int qtPunctToAndroid(int key)
+{
+    switch (key) {
+    case Qt::Key_Space:
+        return 62;
+    case Qt::Key_Comma:
+        return 55;
+    case Qt::Key_Period:
+        return 56;
+    case Qt::Key_Minus:
+        return 69;
+    case Qt::Key_Equal:
+        return 70;
+    case Qt::Key_BracketLeft:
+        return 71;
+    case Qt::Key_BracketRight:
+        return 72;
+    case Qt::Key_Backslash:
+        return 73;
+    case Qt::Key_Semicolon:
+        return 74;
+    case Qt::Key_Apostrophe:
+        return 75;
+    case Qt::Key_Slash:
+        return 76;
+    case Qt::Key_QuoteLeft:
+        return 68;
+    default:
+        return 0;
+    }
 }
 
 int qtKeyToAndroid(int key)
@@ -439,11 +642,30 @@ int qtKeyToAndroid(int key)
     case Qt::Key_Delete:
         return kAndroidForwardDel;
     case Qt::Key_Home:
+        return kAndroidMoveHome;
+    case Qt::Key_End:
+        return kAndroidMoveEnd;
     case Qt::Key_F2:
         return kAndroidHome;
     case Qt::Key_Menu:
     case Qt::Key_F3:
         return kAndroidAppSwitch;
+    case Qt::Key_Shift:
+        return 59;
+    case Qt::Key_Control:
+        return 113;
+    case Qt::Key_Alt:
+        return 57;
+    case Qt::Key_Meta:
+        return 117;
+    case Qt::Key_PageUp:
+        return 92;
+    case Qt::Key_PageDown:
+        return 93;
+    case Qt::Key_Insert:
+        return 124;
+    case Qt::Key_CapsLock:
+        return 115;
     default:
         return 0;
     }
@@ -468,11 +690,14 @@ void ScreenMonitorDialog::sendNavRecents()
     sendAndroidKey(kAndroidAppSwitch, false);
 }
 
-void ScreenMonitorDialog::sendAndroidKey(int keyCode, bool down)
+void ScreenMonitorDialog::sendAndroidKey(int keyCode, bool down, int meta)
 {
     QJsonObject payload;
     payload.insert(QStringLiteral("k"), keyCode);
     payload.insert(QStringLiteral("d"), down);
+    if (meta != 0) {
+        payload.insert(QStringLiteral("m"), meta);
+    }
     sendQuiet(QStringLiteral("input_key"), payload);
 }
 
@@ -480,6 +705,72 @@ void ScreenMonitorDialog::sendTouch(const char *action, double nx, double ny)
 {
     QJsonObject payload;
     payload.insert(QStringLiteral("a"), QString::fromUtf8(action));
+    payload.insert(QStringLiteral("x"), nx);
+    payload.insert(QStringLiteral("y"), ny);
+    sendQuiet(QStringLiteral("input_touch"), payload);
+}
+
+void ScreenMonitorDialog::sendCursor(double nx, double ny, bool visible)
+{
+    // No yellow pointer until video is on screen. Otherwise a hover during
+    // "Waiting for video…" paints the phone before anything is connected.
+    if (visible && (m_frameCount <= 0 || !m_streaming || m_disconnected)) {
+        return;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (visible) {
+        if (m_cursorShown && now - m_lastCursorTick < kCursorMinGapMs) {
+            // Rate-limited, but not thrown away. The position right before the
+            // mouse comes to rest is the one that matters most, and it is also
+            // the one most likely to land inside this window — dropping it left
+            // the phone's circle wherever the mouse happened to be a frame
+            // earlier, with nothing following to correct it.
+            m_cursorFlushX = nx;
+            m_cursorFlushY = ny;
+            m_cursorFlushPending = true;
+            if (m_cursorFlushTimer && !m_cursorFlushTimer->isActive()) {
+                m_cursorFlushTimer->start(kCursorMinGapMs);
+            }
+            return;
+        }
+    } else if (!m_cursorShown) {
+        return;
+    }
+    writeCursor(nx, ny, visible);
+}
+
+/**
+ * The mouse has stopped, or at least paused long enough that the last position
+ * we held back is now the current one. Send it so the phone ends up where the
+ * pointer actually is.
+ */
+void ScreenMonitorDialog::onCursorFlush()
+{
+    if (!m_cursorFlushPending) {
+        return;
+    }
+    m_cursorFlushPending = false;
+    if (!m_cursorShown || !m_streaming || m_disconnected || m_frameCount <= 0) {
+        return;
+    }
+    writeCursor(m_cursorFlushX, m_cursorFlushY, true);
+}
+
+// Puts a cursor position on the wire, bypassing the rate limit. Everything that
+// decides whether to send has already been decided by the caller.
+void ScreenMonitorDialog::writeCursor(double nx, double ny, bool visible)
+{
+    m_cursorFlushPending = false;
+    if (m_cursorFlushTimer) {
+        m_cursorFlushTimer->stop();
+    }
+    m_lastCursorTick = QDateTime::currentMSecsSinceEpoch();
+    m_lastCursorX = nx;
+    m_lastCursorY = ny;
+    m_cursorShown = visible;
+    QJsonObject payload;
+    payload.insert(QStringLiteral("a"),
+                   visible ? QStringLiteral("hover") : QStringLiteral("hover_end"));
     payload.insert(QStringLiteral("x"), nx);
     payload.insert(QStringLiteral("y"), ny);
     sendQuiet(QStringLiteral("input_touch"), payload);
@@ -493,6 +784,19 @@ void ScreenMonitorDialog::sendText(const QString &text)
     QJsonObject payload;
     payload.insert(QStringLiteral("t"), text);
     sendQuiet(QStringLiteral("input_text"), payload);
+}
+
+void ScreenMonitorDialog::sendClip(const QString &action)
+{
+    QJsonObject payload;
+    payload.insert(QStringLiteral("clip"), action);
+    if (action == QLatin1String("paste")) {
+        const QString text = QGuiApplication::clipboard()->text();
+        if (!text.isEmpty()) {
+            payload.insert(QStringLiteral("t"), text);
+        }
+    }
+    sendQuiet(QStringLiteral("input_key"), payload);
 }
 
 void ScreenMonitorDialog::sendScroll(double nx, double ny, double vertical)
@@ -523,17 +827,22 @@ void ScreenMonitorDialog::handlePreviewEvent(const ScreenInputView::Event &ev)
         break;
     }
     case ScreenInputView::Kind::Move: {
-        if (!m_pressed) {
-            break;
-        }
-        const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        m_lastTouchTick = now;
         double nx = 0.5;
         double ny = 0.5;
-        m_preview->mapNormalized(ev.pos, &nx, &ny);
+        if (!m_preview->mapNormalized(ev.pos, &nx, &ny)) {
+            break;
+        }
+        if (!m_pressed) {
+            sendCursor(nx, ny, true);
+            break;
+        }
+        m_lastTouchTick = QDateTime::currentMSecsSinceEpoch();
         sendTouch("move", nx, ny);
         break;
     }
+    case ScreenInputView::Kind::Leave:
+        sendCursor(0.0, 0.0, false);
+        break;
     case ScreenInputView::Kind::Release: {
         double nx = 0.5;
         double ny = 0.5;
@@ -575,11 +884,39 @@ bool ScreenMonitorDialog::sendRemoteKey(QKeyEvent *event, bool down)
     if (!event) {
         return false;
     }
-    if (event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) {
-        return false;
-    }
+    const Qt::KeyboardModifiers mods = event->modifiers();
+    const int meta = androidMeta(mods);
     const int key = event->key();
-    if (isTextKey(key)) {
+    const bool chord = (mods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) != 0;
+    if ((mods & Qt::ControlModifier) && !(mods & (Qt::AltModifier | Qt::MetaModifier))) {
+        const bool clipKey = key == Qt::Key_C || key == Qt::Key_X || key == Qt::Key_V
+            || key == Qt::Key_A || key == Qt::Key_Insert;
+        if (clipKey) {
+            if (!event->isAutoRepeat() && !down) {
+                if (key == Qt::Key_C || key == Qt::Key_Insert) {
+                    sendClip(QStringLiteral("copy"));
+                } else if (key == Qt::Key_X) {
+                    sendClip(QStringLiteral("cut"));
+                } else if (key == Qt::Key_V) {
+                    sendClip(QStringLiteral("paste"));
+                } else if (key == Qt::Key_A) {
+                    sendClip(QStringLiteral("selectall"));
+                }
+            }
+            return true;
+        }
+    }
+    if (!chord && (mods & Qt::ShiftModifier) && !event->isAutoRepeat() && !down) {
+        if (key == Qt::Key_Insert) {
+            sendClip(QStringLiteral("paste"));
+            return true;
+        }
+        if (key == Qt::Key_Delete) {
+            sendClip(QStringLiteral("cut"));
+            return true;
+        }
+    }
+    if (!chord && isTextKey(key)) {
         if (down) {
             const QString text = event->text();
             if (!text.isEmpty()) {
@@ -588,17 +925,20 @@ bool ScreenMonitorDialog::sendRemoteKey(QKeyEvent *event, bool down)
         }
         return true;
     }
-    const int code = qtKeyToAndroid(key);
-    if (code != 0) {
-        sendAndroidKey(code, down);
-        return true;
+    int code = qtKeyToAndroid(key);
+    if (code == 0 && chord) {
+        code = qtPunctToAndroid(key);
     }
-    if (down) {
+    if (!chord && code == 0 && down) {
         const QString text = event->text();
         if (!text.isEmpty() && text.at(0).isPrint()) {
             sendText(text);
             return true;
         }
+    }
+    if (code != 0) {
+        sendAndroidKey(code, down, meta);
+        return true;
     }
     return false;
 }
@@ -658,7 +998,7 @@ void ScreenMonitorDialog::scheduleDialogFit()
 
 void ScreenMonitorDialog::onVideoStall()
 {
-    if (!m_streaming || m_disconnected) {
+    if (m_sessionClosed || !m_streaming || m_disconnected) {
         return;
     }
     // The watchdog fired. If frames advanced since the last check the stream is
@@ -668,9 +1008,12 @@ void ScreenMonitorDialog::onVideoStall()
     // its own consent launches, so a periodic re-request is safe.
     const bool progressed = m_frameCount != m_stallFrameMark;
     m_stallFrameMark = m_frameCount;
-    if (m_frameCount > 0 && !progressed) {
-        // The phone does not repeat an unchanged screen. Silence here is a still
-        // picture, not a dead capture.
+    if (m_frameCount > 1 && !progressed) {
+        // The phone does not repeat an unchanged screen. Silence here, after more
+        // than the opening picture has arrived, is a still picture, not a dead
+        // capture. A count that never leaves 1 is the other thing: the relay
+        // handed over one snapshot and the live path never started, so fall
+        // through and ask the phone again.
         if (m_stallTimer) {
             m_stallTimer->start(4000);
         }

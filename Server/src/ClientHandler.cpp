@@ -27,6 +27,14 @@
 namespace {
 constexpr int kRecvWaitMs = 1;
 
+// Instrumentation cadence. One report per second is enough to see a standing
+// queue build up, and the echo is a latency sample rather than a per-frame
+// measurement, so it does not need to be any denser.
+constexpr int kStatReportMs = 1000;
+// The phone's rate controller runs on these echoes, so this is also how quickly it
+// can react to a queue building up.
+constexpr int kFrameEchoMs = 200;
+
 // Safety bound for tile updates, which cannot be dropped individually because each
 // one paints over part of the previous picture. Far above anything the pipeline
 // should reach; a whole-screen JPEG is what normally clears a backlog.
@@ -340,6 +348,7 @@ void ClientHandler::drainUdp()
         if (m_udp->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort) < 8) {
             continue;
         }
+        m_rxDatagrams.fetch_add(1);
         if (m_peerPort != 0 && sender == m_peerHost && senderPort == m_peerPort) {
             m_direct = true;
         }
@@ -407,11 +416,52 @@ void ClientHandler::sendUdpPackets(const QByteArray &data)
     }
 }
 
+void ClientHandler::setControlKey(const QString &key)
+{
+    QMutexLocker lock(&m_controlKeyMutex);
+    m_controlKey = key;
+}
+
 void ClientHandler::sendCommand(const QString &action, const QJsonObject &payload)
 {
+    if (m_controlRevoked.load()) {
+        return;
+    }
     QMutexLocker lock(&m_inputMutex);
     m_inputQueue.append(qMakePair(action, payload));
     m_inputWait.wakeOne();
+}
+
+void ClientHandler::revokeControl()
+{
+    m_controlRevoked.store(true);
+    {
+        QMutexLocker lock(&m_controlKeyMutex);
+        m_controlKey.clear();
+    }
+    QMutexLocker lock(&m_inputMutex);
+    m_inputQueue.clear();
+}
+
+void ClientHandler::waitForOutputDrain(int timeoutMs)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeoutMs && !m_stop.load()) {
+        bool empty = false;
+        {
+            QMutexLocker lock(&m_inputMutex);
+            empty = m_inputQueue.isEmpty();
+        }
+        if (empty) {
+            QMutexLocker lock(&m_tcpOutMutex);
+            empty = m_tcpOutQueue.isEmpty();
+        }
+        if (empty) {
+            return;
+        }
+        QThread::msleep(5);
+    }
 }
 
 void ClientHandler::forceClose()
@@ -450,6 +500,7 @@ void ClientHandler::receiveLoop()
         punchDirectTcp();
         drainUdp();
         drainSideChannels();
+        reportVideoStats();
         if (m_iceRestart.exchange(false)) {
             restartOfferer();
         }
@@ -524,6 +575,10 @@ void ClientHandler::pumpPacketsToQueue(QByteArray &buf)
                 if (type == QLatin1String("pair_ok") || type == QLatin1String("sdp")
                     || type == QLatin1String("ice")) {
                     handleSignaling(doc.object());
+                    continue;
+                }
+                if (type == QLatin1String("preview_close")) {
+                    emit remoteShareEnded();
                     continue;
                 }
             }
@@ -650,11 +705,19 @@ void ClientHandler::appendVideoChunk(const QByteArray &payload)
         resetVideoAssembly();
         return;
     }
+    m_rxChunks.fetch_add(1);
     if (m_videoAssembling && frameId != m_videoFrameId) {
         const quint32 ahead = frameId - m_videoFrameId;
         if (ahead > 0x80000000u) {
+            m_rxLateChunks.fetch_add(1);
             return;
         }
+        // The phone has started a new frame while this one is still short of
+        // slices, so those slices were lost on the path and the whole frame goes
+        // with them. There is no retransmit and no FEC, so this is where a few
+        // percent of datagram loss turns into a large drop in delivered frames.
+        m_rxIncomplete.fetch_add(1);
+        m_rxMissingChunks.fetch_add(m_videoChunkCount - m_videoGot);
         resetVideoAssembly();
     }
     if (!m_videoAssembling) {
@@ -672,6 +735,7 @@ void ClientHandler::appendVideoChunk(const QByteArray &payload)
         return;
     }
     if (!m_videoParts.at(chunkIndex).isEmpty()) {
+        m_rxDupChunks.fetch_add(1);
         return;
     }
     m_videoParts[chunkIndex] = QByteArray(payload.constData() + Packet::kVideoPrefixSize, sliceLen);
@@ -762,6 +826,8 @@ bool ClientHandler::compositeTiles(const IncomingMessage &message, QImage *out)
 
 void ClientHandler::decodeAndPublish(const IncomingMessage &message, H264Decoder &decoder)
 {
+    QElapsedTimer decodeTimer;
+    decodeTimer.start();
     const auto *data = reinterpret_cast<const uchar *>(message.payload.constData());
     const int len = message.payload.size();
     const bool tiles = Packet::looksTiles(data, len);
@@ -796,6 +862,48 @@ void ClientHandler::decodeAndPublish(const IncomingMessage &message, H264Decoder
         m_canvas = image.copy();
     }
     publishScaledFrame(std::move(image), message.width, message.height);
+
+    const qint64 decodeMs = decodeTimer.elapsed();
+    m_decodeCount.fetch_add(1);
+    m_decodeMs.fetch_add(decodeMs);
+    if (decodeMs > m_decodeMsMax.load()) {
+        m_decodeMsMax.store(decodeMs);
+    }
+    // Gap between pictures actually reaching the screen. This is the frame rate
+    // the user sees, as opposed to the rate the phone believes it is sending.
+    if (m_frameGapTimer.isValid()) {
+        const qint64 gapMs = m_frameGapTimer.restart();
+        m_gapCount.fetch_add(1);
+        m_gapMs.fetch_add(gapMs);
+        if (gapMs > m_gapMsMax.load()) {
+            m_gapMsMax.store(gapMs);
+        }
+    } else {
+        m_frameGapTimer.start();
+    }
+
+    // Echo the id of the frame we just published so the phone can subtract its own
+    // capture time, plus the slice loss since the previous echo. The phone paces its
+    // stream on both. Rate limited because it travels on the control path that
+    // input shares.
+    if (!m_echoStarted || m_echoTimer.elapsed() >= kFrameEchoMs) {
+        const qint64 chunks = m_rxChunks.load();
+        const qint64 missing = m_rxMissingChunks.load();
+        const qint64 gotDelta = chunks - m_echoChunks;
+        const qint64 missDelta = missing - m_echoMissing;
+        m_echoChunks = chunks;
+        m_echoMissing = missing;
+        const double loss = (gotDelta + missDelta) > 0
+            ? 100.0 * double(missDelta) / double(gotDelta + missDelta)
+            : 0.0;
+        QJsonObject echo;
+        echo.insert(QStringLiteral("type"), QStringLiteral("frame_rx"));
+        echo.insert(QStringLiteral("frameId"), double(message.frameId));
+        echo.insert(QStringLiteral("loss"), loss);
+        queueControlJson(echo);
+        m_echoTimer.restart();
+        m_echoStarted = true;
+    }
 }
 
 void ClientHandler::handleControlPayload(const QByteArray &payload)
@@ -867,7 +975,85 @@ ClientHandler::VideoCounters ClientHandler::videoCounters() const
     c.frames = m_rxFrames.load();
     c.bytes = m_rxBytes.load();
     c.dropped = m_rxDropped.load();
+    c.datagrams = m_rxDatagrams.load();
+    c.chunks = m_rxChunks.load();
+    c.dupChunks = m_rxDupChunks.load();
+    c.lateChunks = m_rxLateChunks.load();
+    c.incomplete = m_rxIncomplete.load();
+    c.missingChunks = m_rxMissingChunks.load();
+    c.decodeCount = m_decodeCount.load();
+    c.decodeMs = m_decodeMs.load();
+    c.gapCount = m_gapCount.load();
+    c.gapMs = m_gapMs.load();
     return c;
+}
+
+// Runs on the receive thread, once a second, for as long as the socket is up — so
+// a stream that has stalled outright still reports zeroes rather than going quiet,
+// which is the case most worth seeing.
+void ClientHandler::reportVideoStats()
+{
+    if (!m_statStarted) {
+        m_statTimer.start();
+        m_statStarted = true;
+        m_statLast = videoCounters();
+        return;
+    }
+    if (m_statTimer.elapsed() < kStatReportMs) {
+        return;
+    }
+    const qint64 windowMs = qMax<qint64>(1, m_statTimer.restart());
+    const VideoCounters now = videoCounters();
+    const VideoCounters was = m_statLast;
+    m_statLast = now;
+
+    const qint64 frames = now.frames - was.frames;
+    const qint64 bytes = now.bytes - was.bytes;
+    const qint64 dropped = now.dropped - was.dropped;
+    const qint64 datagrams = now.datagrams - was.datagrams;
+    const qint64 chunks = now.chunks - was.chunks;
+    const qint64 dupChunks = now.dupChunks - was.dupChunks;
+    const qint64 lateChunks = now.lateChunks - was.lateChunks;
+    const qint64 incomplete = now.incomplete - was.incomplete;
+    const qint64 missing = now.missingChunks - was.missingChunks;
+    const qint64 decodeCount = now.decodeCount - was.decodeCount;
+    const qint64 decodeMs = now.decodeMs - was.decodeMs;
+    const qint64 gapCount = now.gapCount - was.gapCount;
+    const qint64 gapMs = now.gapMs - was.gapMs;
+
+    if (frames == 0 && datagrams == 0 && chunks == 0) {
+        return;
+    }
+
+    const double perSec = 1000.0 / double(windowMs);
+    // Share of slices that never arrived. Compared against the frame loss above it
+    // shows the amplification: losing this fraction of datagrams costs a much
+    // larger fraction of frames, because every slice of a frame is mandatory.
+    const double lossPercent = (chunks + missing) > 0
+        ? 100.0 * double(missing) / double(chunks + missing)
+        : 0.0;
+
+    const QString line =
+        QStringLiteral("rx %1/s %2KB/s jpeg %3k | dg %4/s chunk %5/s dup %6 late %7"
+                       " | lost %8 frames %9 slices (%10%) | qdrop %11/s"
+                       " | decode %12/%13ms gap %14/%15ms | path %16")
+            .arg(frames * perSec, 0, 'f', 1)
+            .arg(double(bytes) * perSec / 1024.0, 0, 'f', 0)
+            .arg(frames > 0 ? double(bytes) / double(frames) / 1024.0 : 0.0, 0, 'f', 0)
+            .arg(datagrams * perSec, 0, 'f', 0)
+            .arg(chunks * perSec, 0, 'f', 0)
+            .arg(dupChunks)
+            .arg(lateChunks)
+            .arg(incomplete)
+            .arg(missing)
+            .arg(lossPercent, 0, 'f', 1)
+            .arg(dropped * perSec, 0, 'f', 1)
+            .arg(decodeCount > 0 ? decodeMs / decodeCount : 0)
+            .arg(m_decodeMsMax.exchange(0))
+            .arg(gapCount > 0 ? gapMs / gapCount : 0)
+            .arg(m_gapMsMax.exchange(0))
+            .arg(m_direct ? QStringLiteral("direct") : QStringLiteral("relay"));
+    emit messageReceived(m_info.id, line);
 }
 
 void ClientHandler::resyncFrameNotify()
@@ -954,6 +1140,17 @@ void ClientHandler::processLine(const QByteArray &line)
         return;
     }
 
+    // The phone's own one-second rollup. Logged next to ours so the send side and
+    // the receive side of the same second can be read together — which is the only
+    // way to tell a phone that is not producing frames from a path that is losing
+    // them.
+    if (type == QLatin1String("stream_stats")) {
+        emit messageReceived(m_info.id,
+                             QStringLiteral("phone %1")
+                                 .arg(object.value(QStringLiteral("line")).toString()));
+        return;
+    }
+
     if (type == QLatin1String("response") || type == QLatin1String("event")) {
         const QString action = object.value(QStringLiteral("action")).toString();
         const QJsonObject payload = object.value(QStringLiteral("payload")).toObject();
@@ -971,6 +1168,22 @@ void ClientHandler::processLine(const QByteArray &line)
 void ClientHandler::sendJson(const QJsonObject &object)
 {
     enqueueOutgoing(Packet::encodeControlJson(object));
+}
+
+// Control JSON on the outbound path the phone actually reads. sendJson() is not
+// usable for this: it only appends to m_pendingOut, which is flushed solely by a
+// FlushOutEvent that nothing posts, so anything written there is never sent.
+void ClientHandler::queueControlJson(const QJsonObject &object)
+{
+    const QByteArray packet = Packet::encodeControlJson(object);
+    if (packet.isEmpty()) {
+        return;
+    }
+    {
+        QMutexLocker lock(&m_tcpOutMutex);
+        m_tcpOutQueue.append(packet);
+    }
+    m_tcpOutWait.wakeOne();
 }
 
 void ClientHandler::signalCaptureStart(const QByteArray &data)
@@ -1024,6 +1237,12 @@ void ClientHandler::inputLoop()
         }
         payload.insert(QStringLiteral("isid"), sessionId);
         payload.insert(QStringLiteral("iseq"), ++seq);
+        {
+            QMutexLocker lock(&m_controlKeyMutex);
+            if (!m_controlKey.isEmpty()) {
+                payload.insert(QStringLiteral("ck"), m_controlKey);
+            }
+        }
         const QByteArray packet = Packet::encodeCommand(action, payload);
         if (packet.isEmpty()) {
             continue;
@@ -1090,6 +1309,27 @@ static SOCKET dialInput9001(const QByteArray &host)
         return INVALID_SOCKET;
     }
     return s;
+}
+
+/**
+ * True when a socket has connected to this very process. Dialling the phone's
+ * public address from local port 9001 to remote port 9001 can come straight
+ * back: a hairpinning router, or a TCP simultaneous open, leaves us talking to
+ * our own listener. Nothing on the other end ever reads, so every input event
+ * written there is lost without an error.
+ */
+static bool isSelfConnect(SOCKET s)
+{
+    sockaddr_in local{};
+    sockaddr_in remote{};
+    int localLen = sizeof(local);
+    int remoteLen = sizeof(remote);
+    if (::getsockname(s, reinterpret_cast<sockaddr *>(&local), &localLen) != 0
+        || ::getpeername(s, reinterpret_cast<sockaddr *>(&remote), &remoteLen) != 0) {
+        return false;
+    }
+    return local.sin_port == remote.sin_port
+            && local.sin_addr.s_addr == remote.sin_addr.s_addr;
 }
 
 // 1 = connected, 0 = still pending, -1 = failed. Never blocks.
@@ -1205,7 +1445,7 @@ void ClientHandler::sendLoop()
         }
         if (dialing != INVALID_SOCKET) {
             const int state = pollDial(dialing);
-            if (state > 0 && conn == INVALID_SOCKET) {
+            if (state > 0 && conn == INVALID_SOCKET && !isSelfConnect(dialing)) {
                 conn = dialing;
                 dialing = INVALID_SOCKET;
             } else if (state != 0 || conn != INVALID_SOCKET || dialTimer.elapsed() > 3000) {
@@ -1236,13 +1476,20 @@ void ClientHandler::sendLoop()
             packet = m_tcpOutQueue.takeFirst();
         }
         sendInputUdpDirect(packet);
-        if (conn != INVALID_SOCKET && sendAll(conn, packet)) {
-            continue;
-        }
-        if (conn != INVALID_SOCKET) {
+        if (conn != INVALID_SOCKET && !sendAll(conn, packet)) {
             ::closesocket(conn);
             conn = INVALID_SOCKET;
         }
+        // The relay copy always goes out too, even when the direct socket took
+        // the packet. A successful send() only proves the kernel accepted the
+        // bytes, not that the phone will ever read them: the dial to port 9001
+        // routinely lands on a NAT, a router, or another device that shares the
+        // phone's public address and then swallows everything in silence. That
+        // is what made clicks need several tries and made Back/Home/Recents —
+        // one packet each, with nobody to repeat them — look completely dead.
+        // Input is a few hundred bytes an event, so paying for it twice costs
+        // nothing next to losing it. The phone runs whichever copy arrives
+        // first and drops the other by sequence number.
         writeRelayTcp(packet);
     }
     if (dialing != INVALID_SOCKET) {

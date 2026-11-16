@@ -112,21 +112,26 @@ qt_add_executable(MProjectServer
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg")
 
 target_include_directories(MProjectServer PRIVATE src "${SHARED_DIR}" "${FFMPEG_DIR}/include")
+# H.264 decode plus swscale. swresample is not called, but avcodec-62.dll
+# imports it, so the DLL is deployed below and is not linked into the exe.
 target_link_libraries(MProjectServer PRIVATE Qt6::Widgets Qt6::Network
     LibDataChannel::LibDataChannel
     "${FFMPEG_DIR}/lib/libavcodec.dll.a"
     "${FFMPEG_DIR}/lib/libavutil.dll.a"
     "${FFMPEG_DIR}/lib/libswscale.dll.a"
-    "${FFMPEG_DIR}/lib/libswresample.dll.a"
 )
 
-# Ship the FFmpeg runtime DLLs next to the executable (app dir wins on the DLL
-# search path, so these are used even if another FFmpeg is elsewhere on PATH).
+# Ship only the FFmpeg runtime this decoder loads. avformat, avfilter,
+# avdevice, and the ffmpeg/ffplay/ffprobe tools are not referenced.
 if (WIN32)
     add_custom_command(TARGET MProjectServer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_DIR}/bin" "$<TARGET_FILE_DIR:MProjectServer>"
-        COMMENT "Deploying bundled FFmpeg DLLs"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFMPEG_DIR}/bin/avcodec-62.dll"
+            "${FFMPEG_DIR}/bin/avutil-60.dll"
+            "${FFMPEG_DIR}/bin/swscale-9.dll"
+            "${FFMPEG_DIR}/bin/swresample-6.dll"
+            "$<TARGET_FILE_DIR:MProjectServer>"
+        COMMENT "Deploying H.264 FFmpeg runtime"
     )
     if(EXISTS "C:/msys64/mingw64/bin/libcrypto-3-x64.dll")
         add_custom_command(TARGET MProjectServer POST_BUILD
@@ -160,12 +165,39 @@ if (WIN32)
     get_filename_component(_qt_bin_dir "${_qmake_executable}" DIRECTORY)
     find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${_qt_bin_dir}")
     if (WINDEPLOYQT_EXECUTABLE)
+        # Fusion is built into Qt Widgets. PNG is built into Qt Gui.
+        # Remote frames are JPEG, decoded by imageformats/qjpeg. SVG is
+        # unused. Reachability uses the networkinformation plugin.
         add_custom_command(TARGET MProjectServer POST_BUILD
             COMMAND "${WINDEPLOYQT_EXECUTABLE}"
                 $<$<CONFIG:Release>:--release>
                 $<$<CONFIG:Debug>:--debug>
                 --compiler-runtime
+                --no-translations
+                --no-system-d3d-compiler
+                --no-opengl-sw
+                --no-ffmpeg
+                --no-svg
+                --exclude-plugins qsvg
+                --skip-plugin-types iconengines,generic,tls,styles
                 \"$<TARGET_FILE:MProjectServer>\"
+            COMMAND ${CMAKE_COMMAND} -E rm -f
+                "$<TARGET_FILE_DIR:MProjectServer>/avdevice-62.dll"
+                "$<TARGET_FILE_DIR:MProjectServer>/avfilter-11.dll"
+                "$<TARGET_FILE_DIR:MProjectServer>/avformat-62.dll"
+                "$<TARGET_FILE_DIR:MProjectServer>/ffmpeg.exe"
+                "$<TARGET_FILE_DIR:MProjectServer>/ffplay.exe"
+                "$<TARGET_FILE_DIR:MProjectServer>/ffprobe.exe"
+                "$<TARGET_FILE_DIR:MProjectServer>/opengl32sw.dll"
+                "$<TARGET_FILE_DIR:MProjectServer>/D3Dcompiler_47.dll"
+                "$<TARGET_FILE_DIR:MProjectServer>/Qt6Svg.dll"
+                "$<TARGET_FILE_DIR:MProjectServer>/imageformats/qsvg.dll"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf
+                "$<TARGET_FILE_DIR:MProjectServer>/iconengines"
+                "$<TARGET_FILE_DIR:MProjectServer>/generic"
+                "$<TARGET_FILE_DIR:MProjectServer>/tls"
+                "$<TARGET_FILE_DIR:MProjectServer>/styles"
+                "$<TARGET_FILE_DIR:MProjectServer>/translations"
             COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/sign-windows-binaries.ps1"
                 \"$<TARGET_FILE:MProjectServer>\"

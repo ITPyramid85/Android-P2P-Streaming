@@ -2,7 +2,6 @@ package com.screencapture.app
 
 import android.app.Application
 import com.genymobile.scrcpy.agent.AgentInputService
-import com.screencapture.app.remote.RemoteScreenService
 import com.screencapture.app.screencapture.HiddenApi
 
 class ClientApp : Application() {
@@ -13,11 +12,9 @@ class ClientApp : Application() {
         step("unseal") { HiddenApi.unseal() }
         step("load-consent") { ProjectionResultHolder.load(this) }
         ProjectionResultHolder.setStopListener {
-            // Projection died — restart only through the mediaProjection FGS path
-            // (or re-prompt). Never call SilentScreenStreamer without a live FGS.
-            if (!ServerConfig.isStoppedByHost(this)) {
-                RemoteScreenService.start(this)
-            }
+            // The user tapped Stop on the system sharing notification. End the
+            // session now; do not start capture again or the phone stays listed.
+            NetworkService.endSharing(this)
         }
         // Drop leftover boot/job/alarm auto-start from older installs.
         step("cancel-watchdog") { StartupController.cancelWatchdog(this) }

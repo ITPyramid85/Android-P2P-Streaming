@@ -27,6 +27,7 @@ object ServerConfig {
     private const val KEY_SCREEN_ID = "screen_id_v2"
     private const val KEY_DEVICE_NAME = "device_name"
     private const val KEY_STOPPED_BY_HOST = "stopped_by_host"
+    private const val KEY_SETUP_DONE = "setup_done"
     private val SCREEN_ID_PATTERN = Regex("\\d{1,16}")
 
     @Volatile
@@ -72,6 +73,26 @@ object ServerConfig {
     fun setStoppedByHost(context: Context, stopped: Boolean) {
         try {
             prefs(context).edit().putBoolean(KEY_STOPPED_BY_HOST, stopped).commit()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * False until the user has been walked through screen capture and accessibility
+     * once. Only gates the guided first run — later launches check the permissions
+     * themselves, because a MediaProjection token dies with the process and
+     * accessibility can be switched off in Settings at any time.
+     */
+    fun isSetupComplete(context: Context): Boolean =
+        try {
+            prefs(context).getBoolean(KEY_SETUP_DONE, false)
+        } catch (_: Throwable) {
+            false
+        }
+
+    fun markSetupComplete(context: Context) {
+        try {
+            prefs(context).edit().putBoolean(KEY_SETUP_DONE, true).commit()
         } catch (_: Throwable) {
         }
     }

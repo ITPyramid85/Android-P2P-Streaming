@@ -20,7 +20,9 @@
 #include <ctime>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <map>
+#include <random>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -524,6 +526,17 @@ Payload control_payload(const char *json)
 struct DesktopSlot {
     SOCKET sock = INVALID_SOCKET;
     std::string ip;
+    std::string id;
+    // Shown on the phone's dashboard when this controller takes a mobile.
+    std::string name;
+    std::string detail;
+    std::string device;
+    // Last time anything arrived on this control socket. A controller that stops
+    // answering has to be noticed quickly, because the mobile it holds stays
+    // unavailable to everyone else until this socket is declared dead.
+    std::atomic<uint64_t> last_rx_ms{0};
+    /** One control frame at a time. List updates are written from several threads. */
+    std::mutex send_mu;
 };
 
 /**
@@ -566,6 +579,16 @@ struct AgentSlot {
     Payload last_frame;
 
     std::atomic<bool> alive{true};
+    /** User stopped sharing, or the one-hour limit elapsed. Desktops drop the row. */
+    std::atomic<bool> ended{false};
+
+    /**
+     * The phone has screen capture and its accessibility service up and is able to
+     * serve a session right now. Starts false and is only ever set by the phone
+     * saying so: a mobile that cannot stream or cannot be clicked must not appear
+     * on anyone's list, and a registered socket on its own proves neither.
+     */
+    std::atomic<bool> ready{false};
 };
 
 /** One connected desktop: its own send thread, its own cursor into the queue. */
@@ -583,6 +606,76 @@ struct Viewer {
     std::atomic<bool> stop{false};
     std::thread send_th;
 };
+
+/** A controller may hold a mobile for this long before the relay ends the session. */
+constexpr uint64_t kSessionLimitMs = 60ULL * 60 * 1000;
+
+/**
+ * A control socket silent for this long is treated as a dead controller. The
+ * desktop pings every few seconds, so this only trips on a real loss — and it has
+ * to be short, because the mobile it holds cannot be handed to anyone else until
+ * the loss is noticed.
+ */
+constexpr uint64_t kDesktopIdleMs = 12000;
+
+uint64_t now_ms()
+{
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+}
+
+/**
+ * One sharing session of one mobile, from the moment the user starts sharing until
+ * that offer is used up. The relay owns this because it is the only party that sees
+ * every controller.
+ *
+ * [share_id] identifies the mobile's sharing session itself. It is generated once
+ * when the user starts sharing and is resent unchanged on every reconnect, so a
+ * dropped phone socket resumes the same session while an explicit restart creates a
+ * new one — which is what earns a fresh hour.
+ *
+ * [consumed] is the "no second chance" rule: once the owner is lost without a clean
+ * release, or the hour runs out, this offer is over for everybody. Only the mobile
+ * starting to share again clears it.
+ */
+struct ShareSession {
+    std::string share_id;
+    std::string owner;
+    bool consumed = false;
+    uint64_t deadline_ms = 0;
+    /**
+     * Minted fresh every time a controller takes this mobile, and handed to both
+     * sides. The phone only obeys input stamped with the current key, which is what
+     * actually revokes the previous controller: it may still hold a punched UDP or
+     * direct-TCP path to the phone that the relay cannot reach in to close.
+     */
+    std::string control_key;
+    /**
+     * Phone socket this offer is bound to. A goodbye from an older socket must
+     * not erase the offer a newer socket has already opened.
+     */
+    uint32_t slot_session = 0;
+};
+
+/** Unguessable enough to stop a stale controller replaying the previous key. */
+std::string make_control_key()
+{
+    static std::mutex mu;
+    static std::mt19937_64 rng(std::chrono::steady_clock::now().time_since_epoch().count()
+                               ^ uint64_t(GetCurrentProcessId()));
+    uint64_t a = 0;
+    uint64_t b = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        a = rng();
+        b = rng();
+    }
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%016llx%016llx",
+             static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+    return std::string(buf);
+}
 
 void reset_staging(AgentSlot *agent)
 {
@@ -623,7 +716,7 @@ public:
             json_string(json, "type", &type);
             json_string(json, "role", &role);
             if (type == "hello" && role == "desktop") {
-            handle_desktop(sock);
+            handle_desktop(sock, json);
             } else if (type == "hello" && role == "attach") {
                 std::string agent_id;
             std::string desktop_id;
@@ -647,6 +740,13 @@ private:
     std::mutex tcp_mutex_;
     std::vector<DesktopSlot *> desktops_;
     std::map<std::string, std::shared_ptr<AgentSlot>> agents_;
+    std::mutex claim_mu_;
+    std::map<std::string, ShareSession> sessions_;
+    // Share ids the user already stopped. A socket that comes back with the same
+    // id must not reopen the offer; only a new Start (a different share id) does.
+    std::map<std::string, std::string> stopped_share_;
+    /** Serialises list broadcasts so every controller sees them in the same order. */
+    std::mutex announce_mu_;
     std::atomic<uint32_t> next_session_{100};
 
     std::mutex viewers_mu_;
@@ -692,8 +792,15 @@ private:
     {
         std::vector<std::shared_ptr<AgentSlot>> live;
         std::vector<uint8_t> packet;
+        uint64_t next_expiry_check = 0;
         while (!g_stop.load()) {
             rx_epoch_.fetch_add(1);
+            const uint64_t now = now_ms();
+            if (now >= next_expiry_check) {
+                next_expiry_check = now + 1000;
+                expire_sessions();
+                expire_desktops();
+            }
             live.clear();
             {
                 std::lock_guard<std::mutex> lock(tcp_mutex_);
@@ -730,21 +837,28 @@ private:
                     continue;
                 }
                 // Readable with nothing pending means the phone closed the socket.
-                if (socket_available(a->sock) <= 0 || !pull_available(a->sock, &a->rx_buf)) {
-                    mark_agent_dead(a.get());
-                    continue;
-                }
+                // Packets already pulled — including session_end sitting in front
+                // of the FIN — have to be handled before the socket is retired,
+                // or the desktop never hears that sharing stopped.
+                const bool peer_gone = socket_available(a->sock) <= 0
+                        || !pull_available(a->sock, &a->rx_buf);
                 while (pop_one_packet(&a->rx_buf, &packet)) {
                     if (packet.empty()) {
                         continue;
                     }
                     if (packet[0] == FLAG_VIDEO) {
-                        // Distant peers often stay in ICE "connecting". Until the
-                        // data channel opens, the phone sends the same JPEG frames
-                        // on this socket so the desktop still gets a picture.
+                        // The phone sends every frame on this socket. The viewer
+                        // thread of whoever is attached right now is what reads
+                        // the queue, so a controller that connects after another
+                        // one pressed Stop gets the live picture instead of the
+                        // address the previous punch happened to hold.
                         RxPacket item;
                         item.agent_id = a->id;
                         if (assemble(a.get(), std::move(packet), &item)) {
+                            if (item.video && item.data && is_whole_picture(*item.data)) {
+                                std::lock_guard<std::mutex> lock(a->last_mu);
+                                a->last_frame = item.data;
+                            }
                             enqueue_rx(std::move(item));
                         }
                         continue;
@@ -753,9 +867,41 @@ private:
                     if (!packet_json_field(packet, "type", &type)) {
                         continue;
                     }
+                    if (type == "session_end") {
+                        // End the offer before the socket teardown waits. Until
+                        // that wait finished, a controller still holding the
+                        // preview re-attached and the window came back.
+                        a->ended.store(true);
+                        end_viewers(a->id);
+                        {
+                            std::lock_guard<std::mutex> lock(claim_mu_);
+                            auto it = sessions_.find(a->id);
+                            if (it != sessions_.end()
+                                    && it->second.slot_session == a->session_id) {
+                                remember_stopped_locked(a->id, it->second);
+                                sessions_.erase(it);
+                            }
+                        }
+                        publish_current(a->id);
+                        mark_agent_dead(a.get());
+                        continue;
+                    }
+                    if (type == "ready") {
+                        std::string state;
+                        packet_json_field(packet, "state", &state);
+                        set_agent_ready(a, state == "ok");
+                        continue;
+                    }
+                    if (type == "rename") {
+                        rename_agent(a, packet);
+                        continue;
+                    }
                     if (type == "sdp" || type == "ice") {
                         route_agent_signal(a->id, packet);
                     }
+                }
+                if (peer_gone && a->alive.load()) {
+                    mark_agent_dead(a.get());
                 }
             }
         }
@@ -930,7 +1076,7 @@ private:
 
     void run_viewer_send(std::shared_ptr<Viewer> viewer)
     {
-        while (!g_stop.load() && !viewer->stop.load()) {
+        while (!g_stop.load()) {
             Payload out;
             {
                 std::lock_guard<std::mutex> lock(viewer->mu);
@@ -939,11 +1085,22 @@ private:
                     viewer->pending.pop_front();
                 }
             }
-            if (!out && !take_for_viewer(viewer.get(), &out)) {
-                Sleep(1);
-                continue;
+            if (!out) {
+                // preview_close is queued and then stop is set. Leave only
+                // after that packet has been written, so the desktop window
+                // closes instead of sitting on the last frame.
+                if (viewer->stop.load()) {
+                    break;
+                }
+                if (!take_for_viewer(viewer.get(), &out)) {
+                    Sleep(1);
+                    continue;
+                }
             }
             if (!out || out->empty()) {
+                if (viewer->stop.load()) {
+                    break;
+                }
                 continue;
             }
             if (!send_all(viewer->sock, out->data(), out->size())) {
@@ -1012,6 +1169,36 @@ private:
                 shutdown(s, SD_BOTH);
             }
         }
+    }
+
+    /**
+     * The phone stopped sharing. Tell every open preview to close itself, let
+     * that packet leave, then drop the socket. Closing the socket alone left
+     * the desktop window up, waiting to attach again.
+     */
+    void end_viewers(const std::string &agent_id)
+    {
+        const Payload bye = control_payload("{\"type\":\"preview_close\"}");
+        auto viewers = viewers_of(agent_id);
+        for (auto &v : viewers) {
+            std::lock_guard<std::mutex> lock(v->mu);
+            v->pending.push_back(bye);
+            v->stop.store(true);
+        }
+        for (int i = 0; i < 40; ++i) {
+            bool pending = false;
+            for (auto &v : viewers) {
+                std::lock_guard<std::mutex> lock(v->mu);
+                if (!v->pending.empty()) {
+                    pending = true;
+                }
+            }
+            if (!pending) {
+                break;
+            }
+            Sleep(5);
+        }
+        close_viewers_of(agent_id);
     }
 
     // -------------------------------------------------------------- phone commands
@@ -1083,8 +1270,14 @@ private:
                     && action == "screen_monitor_stop") {
                 return;
             }
+            // Ownership is checked on every command, not only when the socket was
+            // opened. A controller that has stopped, been replaced, or had its
+            // claim expire keeps this socket for as long as TCP takes to notice,
+            // and anything it sends in that window must not reach the phone.
+            if (viewer && !owns_session(viewer->desktop_id, viewer->agent_id)) {
+                return;
+            }
         }
-        (void) viewer;
         std::lock_guard<std::mutex> io(agent->io_mu);
         if (!agent->alive.load() || agent->sock == INVALID_SOCKET) {
             return;
@@ -1109,41 +1302,87 @@ private:
 
     // ------------------------------------------------------------------ connections
 
-    void handle_desktop(SOCKET sock)
+    void handle_desktop(SOCKET sock, const char *json)
     {
         DesktopSlot slot;
         slot.sock = sock;
         slot.ip = peer_ip(sock);
+        json_string(json, "desktopId", &slot.id);
+        json_string(json, "name", &slot.name);
+        json_string(json, "detail", &slot.detail);
+        json_string(json, "device", &slot.device);
+        if (slot.name.empty()) {
+            slot.name = slot.id.empty() ? "Support controller" : slot.id;
+        }
+        if (slot.device.empty()) {
+            slot.device = "Remote desktop";
+        }
 
         std::vector<std::shared_ptr<AgentSlot>> agents;
         {
-                        std::lock_guard<std::mutex> lock(tcp_mutex_);
+            std::lock_guard<std::mutex> lock(tcp_mutex_);
             desktops_.push_back(&slot);
             for (auto &kv : agents_) {
                 agents.push_back(kv.second);
             }
         }
 
-        send_control(sock, "{\"type\":\"ack\",\"role\":\"desktop\"}");
+        send_desktop_json(&slot, "{\"type\":\"ack\",\"role\":\"desktop\"}");
         for (auto &agent : agents) {
+            // A phone already in someone else's preview stays off this table.
+            // One claimed by this same desktop (a reconnect) is still listed.
+            const std::string owner = claimed_by_desktop(agent->id);
+            if (!owner.empty() && owner != slot.id) {
+                continue;
+            }
+            // A spent offer is not on offer: it waits for the mobile to re-share.
+            if (session_consumed(agent->id)) {
+                continue;
+            }
+            // Nor is one whose phone cannot currently stream or take input.
+            if (!agent->ready.load()) {
+                continue;
+            }
             notify_desktop(&slot, agent.get(), true);
         }
 
+        slot.last_rx_ms.store(now_ms());
         while (!g_stop.load()) {
             std::vector<uint8_t> payload;
             if (!read_control_frame(sock, &payload)) {
                 break;
             }
+            slot.last_rx_ms.store(now_ms());
+            payload.push_back(0);
+            const char *msg = reinterpret_cast<char *>(payload.data());
+            std::string type;
+            std::string agent_id;
+            json_string(msg, "type", &type);
+            json_string(msg, "agentId", &agent_id);
+            if (type == "claim") {
+                request_claim(&slot, agent_id);
+            } else if (type == "release") {
+                const bool end_share = std::strstr(msg, "\"endShare\":true") != nullptr;
+                release_claim(&slot, agent_id, end_share);
+            } else if (type == "expire") {
+                // The controller's own clock hit one hour. Same ending as the
+                // relay's clock: this message is only a second path into it.
+                if (owns_session(slot.id, agent_id)) {
+                    end_share_session(agent_id, "one hour elapsed");
+                }
+            }
+            // "ping" needs no reply: arriving at all is the liveness proof.
         }
 
+        release_claims_of(&slot);
         std::lock_guard<std::mutex> lock(tcp_mutex_);
         for (auto it = desktops_.begin(); it != desktops_.end(); ++it) {
             if (*it == &slot) {
                 desktops_.erase(it);
-                        break;
-                    }
-                }
+                break;
             }
+        }
+    }
 
     void handle_agent(SOCKET sock, const char *json,
                       const std::vector<uint8_t> &register_frame)
@@ -1157,6 +1396,8 @@ private:
         json_string(json, "model", &agent->model);
         json_string(json, "os", &agent->os);
         json_string(json, "serial", &agent->serial);
+        std::string share_id;
+        json_string(json, "shareId", &share_id);
         agent->ip = peer_ip(sock);
         agent->sock = sock;
         agent->session_id = next_session_.fetch_add(1);
@@ -1182,6 +1423,34 @@ private:
             close_viewers_of(old->id);
         }
 
+        // A new shareId means the user started sharing again, which is the only
+        // thing that reopens a spent offer and grants a fresh hour. The same
+        // shareId is a dropped socket coming back, and must keep its session —
+        // otherwise a network blip would hand out a new hour and let a second
+        // controller in behind the first one's back. A share id that Stop
+        // already spent must not come back as a fresh offer either: erasing
+        // the session used to make the next register look brand new.
+        bool offer_open = true;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto stopped = stopped_share_.find(agent->id);
+            if (stopped != stopped_share_.end() && !share_id.empty()
+                    && stopped->second == share_id) {
+                offer_open = false;
+                agent->ended.store(true);
+            } else {
+                if (stopped != stopped_share_.end()) {
+                    stopped_share_.erase(stopped);
+                }
+                ShareSession &s = sessions_[agent->id];
+                if (share_id.empty() || s.share_id != share_id) {
+                    s = ShareSession();
+                    s.share_id = share_id;
+                }
+                s.slot_session = agent->session_id;
+            }
+        }
+
         {
             const std::string ack =
                     std::string("{\"type\":\"ack\",\"role\":\"agent\",\"clientId\":\"")
@@ -1190,8 +1459,20 @@ private:
             std::lock_guard<std::mutex> io(agent->io_mu);
             send_control(sock, ack.c_str());
         }
-        for (DesktopSlot *desktop : desktops) {
-            notify_desktop(desktop, agent.get(), true);
+        // Nothing is announced here. A socket is not a working mobile: the phone
+        // sends its "ready" the moment capture and accessibility are both up, and
+        // that is what puts it on the operators' lists.
+        (void) desktops;
+        if (!offer_open) {
+            // This socket is the share the user already stopped. Tell the phone
+            // again in case the first share_stop was lost, and do not put it
+            // back on any list.
+            send_to_agent_json(agent->id, "{\"type\":\"share_stop\"}");
+        } else {
+            // A dropped link comes back with the same share id, so the owner and key
+            // are still here. The new socket starts with an empty key and would
+            // refuse every input until the user Stop/Start. Hand the key back now.
+            push_existing_owner(agent->id);
         }
 
         // The shared receive thread reads this socket. Here we only own the
@@ -1224,9 +1505,49 @@ private:
             }
         }
         if (gone) {
-            for (DesktopSlot *desktop : desktops) {
-                notify_offline(desktop, agent->id);
+            // A phone that already registered again owns the offer now. This
+            // socket's goodbye must not erase that offer or it vanishes from
+            // every controller until one of them is restarted.
+            bool still_ours = false;
+            {
+                std::lock_guard<std::mutex> lock(claim_mu_);
+                auto it = sessions_.find(agent->id);
+                still_ours = it != sessions_.end()
+                        && it->second.slot_session == agent->session_id;
+                if (still_ours && agent->ended.load()) {
+                    remember_stopped_locked(agent->id, it->second);
+                    sessions_.erase(it);
+                }
             }
+            if (!still_ours) {
+                // Controller Stop already erased the offer. The row still has to
+                // leave every list, the same way a handset session_end does.
+                if (agent->ended.load()) {
+                    for (DesktopSlot *desktop : desktops) {
+                        notify_offline(desktop, agent->id, false, true, agent->session_id);
+                    }
+                } else {
+                    publish_current(agent->id);
+                }
+            } else if (agent->ended.load()) {
+                for (DesktopSlot *desktop : desktops) {
+                    notify_offline(desktop, agent->id, false, true, agent->session_id);
+                }
+            } else {
+                const std::string owner = claimed_by_desktop(agent->id);
+                for (DesktopSlot *desktop : desktops) {
+                    // Other operators already have the row hidden. A plain offline
+                    // would put it back; keep it hidden until the preview closes.
+                    if (!owner.empty() && desktop->id != owner) {
+                        notify_offline(desktop, agent->id, true, false, agent->session_id);
+                        continue;
+                    }
+                    notify_offline(desktop, agent->id, false, false, agent->session_id);
+                }
+            }
+        } else {
+            // Replaced by a newer socket. Publish that socket, not this one's end.
+            publish_current(agent->id);
         }
         if (agent->done) {
             CloseHandle(agent->done);
@@ -1248,6 +1569,19 @@ private:
         if (!agent || !agent->alive.load()) {
             send_control(sock, "{\"type\":\"error\",\"error\":\"agent not found\"}");
             return;
+        }
+        // The claim is what decides who controls this phone, so it has to be
+        // checked here too: a desktop that never got the grant must not be able to
+        // reach the phone by opening an attach socket of its own.
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto it = sessions_.find(agent_id);
+            const bool owns = it != sessions_.end() && !it->second.consumed
+                    && !it->second.owner.empty() && it->second.owner == desktop_id;
+            if (!owns) {
+                send_control(sock, "{\"type\":\"error\",\"error\":\"not the session owner\"}");
+                return;
+            }
         }
 
         auto viewer = std::make_shared<Viewer>();
@@ -1277,6 +1611,9 @@ private:
             }
         }
         add_viewer(viewer);
+        // The latest whole frame, so the window is not blank until the next
+        // capture. Live frames queued after this cursor follow it.
+        seed_last_frame(agent.get(), viewer.get());
         viewer->send_th = std::thread([this, viewer] { run_viewer_send(viewer); });
         if (stale) {
             SOCKET s = INVALID_SOCKET;
@@ -1403,16 +1740,620 @@ private:
                  json_escape(agent->serial).c_str(),
                  json_escape(agent->ip).c_str(),
                  agent->session_id);
-        send_control(desktop->sock, json);
+        send_desktop_json(desktop, json);
     }
 
-    void notify_offline(DesktopSlot *desktop, const std::string &agent_id)
+    void notify_offline(DesktopSlot *desktop, const std::string &agent_id,
+                        bool busy = false, bool ended = false,
+                        uint32_t session_id = 0)
     {
+        char json[512];
+        if (ended) {
+            snprintf(json, sizeof(json),
+                     "{\"type\":\"peer_offline\",\"id\":\"%s\",\"ended\":true,"
+                     "\"sessionId\":%u}",
+                     json_escape(agent_id).c_str(), session_id);
+        } else if (busy) {
+            snprintf(json, sizeof(json),
+                     "{\"type\":\"peer_offline\",\"id\":\"%s\",\"busy\":true,"
+                     "\"sessionId\":%u}",
+                     json_escape(agent_id).c_str(), session_id);
+        } else {
+            snprintf(json, sizeof(json),
+                     "{\"type\":\"peer_offline\",\"id\":\"%s\",\"sessionId\":%u}",
+                     json_escape(agent_id).c_str(), session_id);
+        }
+        send_desktop_json(desktop, json);
+    }
+
+    std::string claimed_by_desktop(const std::string &agent_id)
+    {
+        std::lock_guard<std::mutex> lock(claim_mu_);
+        auto it = sessions_.find(agent_id);
+        return it == sessions_.end() ? std::string() : it->second.owner;
+    }
+
+    /** True while this controller is the one holding this mobile right now. */
+    bool owns_session(const std::string &desktop_id, const std::string &agent_id)
+    {
+        if (desktop_id.empty() || agent_id.empty()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(claim_mu_);
+        auto it = sessions_.find(agent_id);
+        return it != sessions_.end() && !it->second.consumed
+                && it->second.owner == desktop_id;
+    }
+
+    /** True once this sharing offer is spent: no controller may take it any more. */
+    bool session_consumed(const std::string &agent_id)
+    {
+        std::lock_guard<std::mutex> lock(claim_mu_);
+        auto it = sessions_.find(agent_id);
+        return it != sessions_.end() && it->second.consumed;
+    }
+
+    /** Caller holds claim_mu_. Remembers the share id so the same Start cannot return. */
+    void remember_stopped_locked(const std::string &agent_id, const ShareSession &session)
+    {
+        if (!session.share_id.empty()) {
+            stopped_share_[agent_id] = session.share_id;
+        }
+    }
+
+    void send_session_owner(const std::string &agent_id, const std::string &desktop_id,
+                            const std::string &name, const std::string &detail,
+                            const std::string &device, const std::string &control_key,
+                            uint64_t remain_ms)
+    {
+        if (agent_id.empty() || control_key.empty()) {
+            return;
+        }
+        char to_phone[896];
+        snprintf(to_phone, sizeof(to_phone),
+                 "{\"type\":\"session_owner\",\"remainMs\":%llu,\"controlKey\":\"%s\","
+                 "\"desktopId\":\"%s\",\"name\":\"%s\",\"detail\":\"%s\",\"device\":\"%s\"}",
+                 static_cast<unsigned long long>(remain_ms),
+                 control_key.c_str(),
+                 json_escape(desktop_id).c_str(),
+                 json_escape(name).c_str(),
+                 json_escape(detail).c_str(),
+                 json_escape(device).c_str());
+        send_to_agent_json(agent_id, to_phone);
+    }
+
+    /**
+     * The phone registered again under a share that already has a holder. Give
+     * that socket the key. If the holder is no longer connected, drop the claim
+     * so the phone is not stuck listed and uncontrollable.
+     */
+    void push_existing_owner(const std::string &agent_id)
+    {
+        std::string owner;
+        std::string key;
+        uint64_t remain = 0;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto it = sessions_.find(agent_id);
+            if (it == sessions_.end() || it->second.consumed || it->second.owner.empty()
+                    || it->second.control_key.empty()) {
+                return;
+            }
+            owner = it->second.owner;
+            key = it->second.control_key;
+            const uint64_t now = now_ms();
+            remain = it->second.deadline_ms > now ? it->second.deadline_ms - now : 0;
+        }
+        std::string name;
+        std::string detail;
+        std::string device;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(tcp_mutex_);
+            for (DesktopSlot *desktop : desktops_) {
+                if (desktop->id == owner) {
+                    name = desktop->name;
+                    detail = desktop->detail;
+                    device = desktop->device;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            free_claim(owner, agent_id, "owner offline");
+            return;
+        }
+        send_session_owner(agent_id, owner, name, detail, device, key, remain);
+    }
+
+    void send_to_agent_json(const std::string &agent_id, const std::string &json)
+    {
+        auto agent = find_agent(agent_id);
+        if (!agent) {
+            return;
+        }
+        std::lock_guard<std::mutex> io(agent->io_mu);
+        if (agent->alive.load() && agent->sock != INVALID_SOCKET) {
+            send_control(agent->sock, json.c_str());
+        }
+    }
+
+    void send_desktop_json(DesktopSlot *desktop, const std::string &json)
+    {
+        if (!desktop || desktop->sock == INVALID_SOCKET) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(desktop->send_mu);
+        if (desktop->sock != INVALID_SOCKET) {
+            send_control(desktop->sock, json.c_str());
+        }
+    }
+
+    /** True while this object is the phone socket the map currently points at. */
+    bool is_current_agent(const std::shared_ptr<AgentSlot> &agent)
+    {
+        if (!agent) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(tcp_mutex_);
+        auto it = agents_.find(agent->id);
+        return it != agents_.end() && it->second == agent;
+    }
+
+    /**
+     * Tell every controller the same thing about this mobile, from the relay's
+     * current record. A delayed goodbye from an older socket calls this too, so
+     * it republishes the phone that replaced it instead of wiping the lists.
+     */
+    void publish_current(const std::string &agent_id)
+    {
+        if (agent_id.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> announce(announce_mu_);
+        std::shared_ptr<AgentSlot> agent = find_agent(agent_id);
+        std::string owner;
+        bool consumed = false;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto it = sessions_.find(agent_id);
+            if (it != sessions_.end()) {
+                owner = it->second.owner;
+                consumed = it->second.consumed;
+            }
+        }
+        std::vector<DesktopSlot *> desktops;
+        {
+            std::lock_guard<std::mutex> lock(tcp_mutex_);
+            desktops = desktops_;
+        }
+        const bool live = agent && agent->alive.load();
+        const bool ended_agent = agent && agent->ended.load();
+        const uint32_t session_id = agent ? agent->session_id : 0;
+        // A stopped phone stays in the map until its socket closes. With the
+        // session already erased it used to look unowned and ready, so every
+        // controller put the row back and the preview window opened again.
+        if (!live || consumed || ended_agent || !agent->ready.load()) {
+            for (DesktopSlot *desktop : desktops) {
+                notify_offline(desktop, agent_id, false, consumed || ended_agent, session_id);
+            }
+            return;
+        }
+        for (DesktopSlot *desktop : desktops) {
+            if (!owner.empty() && desktop->id != owner) {
+                notify_offline(desktop, agent_id, true, false, session_id);
+            } else {
+                notify_desktop(desktop, agent.get(), true);
+            }
+        }
+    }
+
+    /**
+     * A controller asks to take this mobile. Granted only while the offer is still
+     * open and unowned; the same controller asking again (its relay socket
+     * reconnected) keeps what it already holds without restarting the hour.
+     */
+    void request_claim(DesktopSlot *desktop, const std::string &agent_id)
+    {
+        if (!desktop || desktop->id.empty() || agent_id.empty()) {
+            return;
+        }
+        bool granted = false;
+        bool became_busy = false;
+        uint64_t remain = 0;
+        std::string control_key;
+        const char *reason = "in_use";
+        // A mobile that is gone, or whose capture or accessibility is down, cannot
+        // serve anybody. Refusing here is what keeps a second operator from taking
+        // a session that would open onto a black window.
+        {
+            auto agent = find_agent(agent_id);
+            if (!agent || !agent->alive.load() || !agent->ready.load() || agent->ended.load()) {
+                char json[256];
+                snprintf(json, sizeof(json),
+                         "{\"type\":\"claim_denied\",\"agentId\":\"%s\","
+                         "\"reason\":\"not_ready\"}",
+                         json_escape(agent_id).c_str());
+                send_desktop_json(desktop, json);
+                return;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto found = sessions_.find(agent_id);
+            // Stop erases the offer. Creating one here used to grant a brand
+            // new session to the window that was trying to re-attach.
+            if (found == sessions_.end()) {
+                reason = "session_closed";
+            } else {
+            ShareSession &s = found->second;
+            const uint64_t now = now_ms();
+            if (s.consumed || (s.deadline_ms != 0 && now >= s.deadline_ms)) {
+                reason = "session_closed";
+            } else if (!s.owner.empty() && s.owner != desktop->id) {
+                reason = "in_use";
+            } else {
+                if (s.owner.empty()) {
+                    s.owner = desktop->id;
+                    // The hour starts at the first accept and then belongs to the
+                    // mobile's sharing session. A controller taking over from one
+                    // that closed its window inherits what is left of it; only the
+                    // mobile sharing again buys a new hour.
+                    if (s.deadline_ms == 0) {
+                        s.deadline_ms = now + kSessionLimitMs;
+                    }
+                    // A new holder gets a new key, which is what stops the previous
+                    // one's input the instant this one is granted.
+                    s.control_key = make_control_key();
+                    became_busy = true;
+                }
+                granted = true;
+                control_key = s.control_key;
+                remain = s.deadline_ms > now ? s.deadline_ms - now : 0;
+            }
+            }
+        }
         char json[256];
+        if (!granted) {
+            snprintf(json, sizeof(json),
+                     "{\"type\":\"claim_denied\",\"agentId\":\"%s\",\"reason\":\"%s\"}",
+                     json_escape(agent_id).c_str(), reason);
+            send_desktop_json(desktop, json);
+            return;
+        }
         snprintf(json, sizeof(json),
-                 "{\"type\":\"peer_offline\",\"id\":\"%s\"}",
-                 json_escape(agent_id).c_str());
-        send_control(desktop->sock, json);
+                 "{\"type\":\"claim_ok\",\"agentId\":\"%s\",\"remainMs\":%llu,"
+                 "\"controlKey\":\"%s\"}",
+                 json_escape(agent_id).c_str(), static_cast<unsigned long long>(remain),
+                 control_key.c_str());
+        send_desktop_json(desktop, json);
+        // Always, including a re-claim of a session this desktop already holds.
+        // After a dropped link the phone's new socket has no key until this
+        // arrives, so input is refused even though the row is back on the list.
+        send_session_owner(agent_id, desktop->id, desktop->name, desktop->detail,
+                           desktop->device, control_key, remain);
+        if (!became_busy) {
+            return;
+        }
+        publish_current(agent_id);
+    }
+
+    /**
+     * The offer is spent (owner lost without releasing, or the hour elapsed). Nobody
+     * may take over: every table drops the row and the phone is told to stop
+     * sharing, so the only way back is the user starting to share again.
+     */
+    void end_share_session(const std::string &agent_id, const char *why)
+    {
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto it = sessions_.find(agent_id);
+            if (it == sessions_.end()) {
+                return;
+            }
+            if (!it->second.consumed) {
+                first = true;
+            }
+            it->second.consumed = true;
+            it->second.owner.clear();
+            it->second.control_key.clear();
+            it->second.deadline_ms = 0;
+        }
+        if (!first) {
+            return;
+        }
+        printf("[relay] share session over for %s (%s)\n", agent_id.c_str(), why);
+        fflush(stdout);
+        // The phone's goodbye must remove the row, not put the device back.
+        if (auto live = find_agent(agent_id)) {
+            live->ended.store(true);
+        }
+        // Drop the preview socket now. Waiting for the controller to notice the
+        // offline row left it looking connected after the hour had already ended.
+        end_viewers(agent_id);
+        send_to_agent_json(agent_id, "{\"type\":\"share_end\"}");
+        publish_current(agent_id);
+    }
+
+    /** Ends any session whose hour has run out. Driven by the receive thread. */
+    void expire_sessions()
+    {
+        std::vector<std::string> expired;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            const uint64_t now = now_ms();
+            for (auto &kv : sessions_) {
+                // An unowned session still runs down: the hour is the mobile's, so
+                // a controller leaving in the middle does not pause it.
+                if (!kv.second.consumed && kv.second.deadline_ms != 0
+                        && now >= kv.second.deadline_ms) {
+                    expired.push_back(kv.first);
+                }
+            }
+        }
+        for (const std::string &agent_id : expired) {
+            end_share_session(agent_id, "one hour elapsed");
+        }
+    }
+
+    std::shared_ptr<AgentSlot> find_agent(const std::string &agent_id)
+    {
+        std::lock_guard<std::mutex> lock(tcp_mutex_);
+        auto it = agents_.find(agent_id);
+        return it == agents_.end() ? nullptr : it->second;
+    }
+
+    void for_other_desktops(const std::string &except_desktop_id,
+                            const std::function<void(DesktopSlot *)> &fn)
+    {
+        std::vector<DesktopSlot *> desktops;
+        {
+            std::lock_guard<std::mutex> lock(tcp_mutex_);
+            desktops = desktops_;
+        }
+        for (DesktopSlot *d : desktops) {
+            if (!except_desktop_id.empty() && d->id == except_desktop_id) {
+                continue;
+            }
+            fn(d);
+        }
+    }
+
+    /**
+     * The phone renamed itself. The list already shows this agent, so republish
+     * the same session with the new label instead of dropping the share.
+     */
+    void rename_agent(const std::shared_ptr<AgentSlot> &agent, const std::vector<uint8_t> &packet)
+    {
+        if (!is_current_agent(agent)) {
+            return;
+        }
+        std::string device;
+        packet_json_field(packet, "device", &device);
+        // The phone already keeps this to 48 characters. Cap the bytes so a
+        // long UTF-8 name still fits the desktop notify buffer, and stop on a
+        // character boundary so the last glyph is not split.
+        if (device.size() > 192) {
+            device.resize(192);
+            while (!device.empty() &&
+                   (static_cast<unsigned char>(device.back()) & 0xC0) == 0x80) {
+                device.pop_back();
+            }
+        }
+        while (!device.empty() && (device.back() == ' ' || device.back() == '\t')) {
+            device.pop_back();
+        }
+        if (device.empty() || device == agent->device) {
+            return;
+        }
+        agent->device = std::move(device);
+        printf("[relay] %s renamed to %s\n", agent->id.c_str(), agent->device.c_str());
+        fflush(stdout);
+        publish_current(agent->id);
+    }
+
+    /**
+     * The phone's own report of whether it can serve a session: screen capture
+     * granted and running, accessibility bound. Nothing is offered until this is
+     * true, and a mobile that loses either mid-session comes straight back off the
+     * list — a row an operator can click but that cannot stream or be clicked is
+     * worse than no row at all.
+     */
+    void set_agent_ready(const std::shared_ptr<AgentSlot> &agent, bool ready)
+    {
+        // A packet still sitting on a socket that a newer registration replaced.
+        // Applying it would take the live phone off every controller's list.
+        if (!agent || !is_current_agent(agent) || agent->ended.load()) {
+            return;
+        }
+        if (agent->ready.exchange(ready) == ready) {
+            return;
+        }
+        if (!is_current_agent(agent)) {
+            return;
+        }
+        printf("[relay] %s is %s\n", agent->id.c_str(),
+               ready ? "ready to share" : "not ready (services down)");
+        fflush(stdout);
+        if (!ready) {
+            // Whoever holds it loses it. The session cannot carry on without
+            // capture or without input, and nobody else may pick it up either.
+            const std::string owner = claimed_by_desktop(agent->id);
+            if (!owner.empty()) {
+                free_claim(owner, agent->id, "mobile services stopped");
+            } else {
+                publish_current(agent->id);
+            }
+            return;
+        }
+        if (session_consumed(agent->id)) {
+            return;
+        }
+        publish_current(agent->id);
+    }
+
+    // Preview closed: put the phone back on every other table, or show it offline
+    // if it left while the window was open.
+    void publish_unclaimed(const std::string &except_desktop_id, const std::string &agent_id)
+    {
+        (void) except_desktop_id;
+        // Every controller, including the one that just let go, gets the same
+        // picture. Leaving one of them out is how their lists drifted apart.
+        publish_current(agent_id);
+    }
+
+    /**
+     * The controller let this mobile go — by closing its window, or by dying. Both
+     * are handled the same way on purpose: the mobile stops streaming at once and
+     * goes straight back on offer, so the next controller can take it without the
+     * customer touching the phone.
+     *
+     * The hour is not reset. It belongs to the mobile's sharing session, not to
+     * whoever happens to be holding it, so a handover continues the same hour.
+     */
+    void free_claim(const std::string &desktop_id, const std::string &agent_id,
+                    const char *why, bool end_share = false)
+    {
+        if (desktop_id.empty() || agent_id.empty()) {
+            return;
+        }
+        bool became_free = false;
+        std::shared_ptr<AgentSlot> stopping = find_agent(agent_id);
+        const uint32_t stopping_session = stopping ? stopping->session_id : 0;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            auto it = sessions_.find(agent_id);
+            if (it != sessions_.end() && it->second.owner == desktop_id) {
+                // A Start that already replaced this socket owns the offer.
+                // This stop must not erase that one.
+                const bool same_socket = !stopping
+                        || it->second.slot_session == stopping_session;
+                if (end_share && same_socket) {
+                    // Same end state as the handset Stop: no owner, no key, no
+                    // hour left to resume. The next Start sends a new share id.
+                    // Mark the socket ended before the session disappears, so a
+                    // list refresh in between cannot publish it as available.
+                    if (stopping) {
+                        stopping->ended.store(true);
+                    }
+                    remember_stopped_locked(agent_id, it->second);
+                    sessions_.erase(it);
+                    became_free = true;
+                } else if (!end_share && !it->second.consumed) {
+                    it->second.owner.clear();
+                    it->second.control_key.clear();
+                    became_free = true;
+                }
+            }
+        }
+        if (!became_free) {
+            return;
+        }
+        printf("[relay] %s released by %s (%s)\n", agent_id.c_str(),
+               desktop_id.c_str(), why);
+        fflush(stdout);
+        // Drop the preview socket so the phone is told to stop capturing right
+        // away. Without this the phone keeps streaming into a window nobody is
+        // watching, and the next controller inherits that backlog. Stop also
+        // tells the open window to close; a plain release only detaches it.
+        if (end_share) {
+            end_viewers(agent_id);
+        } else {
+            close_viewers_of(agent_id);
+        }
+        // Then say it outright. Closing the preview socket used to be the only
+        // signal the phone got, which made the teardown depend on which thread
+        // noticed the dead socket first — and on a controller that managed to
+        // flush its own stop before its threads were torn down. The phone must
+        // not be left controllable by a controller that is already gone, so the
+        // relay states it on the one link that is certainly up.
+        if (end_share) {
+            // Same outcome as the handset's Stop button: sharing and remote
+            // control end, and the app is left running. Mark only the socket
+            // that was holding the offer, so a newer Start stays up.
+            auto live = find_agent(agent_id);
+            if (live && stopping && live.get() == stopping.get()) {
+                live->ended.store(true);
+                send_to_agent_json(agent_id, "{\"type\":\"share_stop\"}");
+            }
+            // Every controller drops the row and closes its window now. Waiting
+            // for the phone socket to die left the preview re-attaching.
+            publish_current(agent_id);
+            return;
+        }
+        send_to_agent_json(agent_id,
+                "{\"type\":\"command\",\"action\":\"screen_monitor_stop\",\"payload\":{}}");
+        send_to_agent_json(agent_id, "{\"type\":\"control_revoked\"}");
+        publish_unclaimed(desktop_id, agent_id);
+    }
+
+    void release_claim(DesktopSlot *desktop, const std::string &agent_id,
+                       bool end_share = false)
+    {
+        if (!desktop) {
+            return;
+        }
+        free_claim(desktop->id, agent_id, end_share ? "stop button" : "window closed",
+                   end_share);
+    }
+
+
+    void release_claims_of(DesktopSlot *desktop)
+    {
+        if (!desktop || desktop->id.empty()) {
+            return;
+        }
+        {
+            // A second socket with the same id is a reconnect that still owns
+            // these previews. Dropping the claims here would flash the phones
+            // back onto every other table.
+            std::lock_guard<std::mutex> lock(tcp_mutex_);
+            for (DesktopSlot *other : desktops_) {
+                if (other != desktop && other->id == desktop->id) {
+                    return;
+                }
+            }
+        }
+        std::vector<std::string> agents;
+        {
+            std::lock_guard<std::mutex> lock(claim_mu_);
+            for (auto &kv : sessions_) {
+                if (kv.second.owner == desktop->id) {
+                    agents.push_back(kv.first);
+                }
+            }
+        }
+        for (const std::string &agent_id : agents) {
+            free_claim(desktop->id, agent_id, "controller disconnected");
+        }
+    }
+
+    /**
+     * Cut loose any control socket that has gone quiet. The desktop pings, so
+     * silence means the controller is gone even though TCP has not noticed yet —
+     * and until it is cut, the mobile it holds is stuck being unavailable.
+     */
+    void expire_desktops()
+    {
+        std::vector<SOCKET> dead;
+        {
+            const uint64_t now = now_ms();
+            std::lock_guard<std::mutex> lock(tcp_mutex_);
+            for (DesktopSlot *d : desktops_) {
+                const uint64_t last = d->last_rx_ms.load();
+                if (last != 0 && now > last + kDesktopIdleMs
+                        && d->sock != INVALID_SOCKET) {
+                    dead.push_back(d->sock);
+                }
+            }
+        }
+        // shutdown() unblocks the reader, whose own thread then runs
+        // release_claims_of and hands the mobile back.
+        for (SOCKET s : dead) {
+            shutdown(s, SD_BOTH);
+        }
     }
 };
 

@@ -7,8 +7,10 @@
 #include <QFont>
 #include <QGuiApplication>
 #include <QHeaderView>
+#include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
+#include <QNetworkInformation>
 #include <QModelIndex>
 #include <QPoint>
 #include <QSplitter>
@@ -53,6 +55,8 @@ QIcon makeStatusIcon(bool online)
 }
 }
 
+MainWindow::~MainWindow() = default;
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
@@ -64,8 +68,13 @@ MainWindow::MainWindow(QWidget *parent)
     m_server = new TcpServer(this);
     connect(m_server, &TcpServer::clientRegistered, this, &MainWindow::onClientRegistered);
     connect(m_server, &TcpServer::clientDisconnected, this, &MainWindow::onClientDisconnected);
+    connect(m_server, &TcpServer::clientBusy, this, &MainWindow::onClientBusy);
+    connect(m_server, &TcpServer::clientRemoved, this, &MainWindow::onClientRemoved);
+    connect(m_server, &TcpServer::agentClaimed, this, &MainWindow::onAgentClaimed);
+    connect(m_server, &TcpServer::agentClaimDenied, this, &MainWindow::onAgentClaimDenied);
     connect(m_server, &TcpServer::clientMessage, this, &MainWindow::onClientMessage);
     connect(m_server, &TcpServer::logMessage, this, &MainWindow::onServerLog);
+    watchInternet();
 }
 
 void MainWindow::lockSession()
@@ -98,6 +107,15 @@ void MainWindow::setupUi()
     auto *layout = new QVBoxLayout(central);
     layout->setContentsMargins(12, 12, 12, 12);
     layout->setSpacing(10);
+
+    m_offlineBanner = new QLabel(QStringLiteral("Not Connected to the Internet"), central);
+    m_offlineBanner->setAlignment(Qt::AlignCenter);
+    m_offlineBanner->setWordWrap(true);
+    m_offlineBanner->setStyleSheet(QStringLiteral(
+        "QLabel { background: #FDECEC; color: #9B1C1C; border: 1px solid #E6B0B0;"
+        " border-radius: 8px; padding: 10px 14px; font-weight: 700; font-size: 15px; }"));
+    m_offlineBanner->setVisible(false);
+    layout->addWidget(m_offlineBanner);
 
     m_splitter = new QSplitter(Qt::Vertical, central);
 
@@ -145,6 +163,10 @@ void MainWindow::setupUi()
     m_table->setColumnWidth(6, 158);
     m_table->setColumnWidth(kColStatus, 88);
     m_table->verticalHeader()->setDefaultSectionSize(34);
+    // Order is applied in code from the Connected At column. Leaving header
+    // clicks unsorted keeps a status update from shuffling the rows.
+    header->setSortIndicatorShown(true);
+    header->setSortIndicator(6, Qt::DescendingOrder);
     connect(m_table, &QTableWidget::cellPressed, this, [this](int, int) {
         if (QGuiApplication::mouseButtons() == Qt::RightButton) {
             return;
@@ -173,6 +195,44 @@ void MainWindow::setupUi()
     setCentralWidget(central);
 }
 
+void MainWindow::watchInternet()
+{
+    if (!QNetworkInformation::loadDefaultBackend()) {
+        QNetworkInformation::loadBackendByFeatures(QNetworkInformation::Feature::Reachability);
+    }
+    QNetworkInformation *net = QNetworkInformation::instance();
+    if (!net || !net->supports(QNetworkInformation::Feature::Reachability)) {
+        return;
+    }
+    connect(net, &QNetworkInformation::reachabilityChanged,
+            this, &MainWindow::applyInternetReachability);
+    applyInternetReachability(net->reachability());
+}
+
+void MainWindow::applyInternetReachability(QNetworkInformation::Reachability reach)
+{
+    if (reach == QNetworkInformation::Reachability::Unknown) {
+        return;
+    }
+    const bool offline = reach != QNetworkInformation::Reachability::Online;
+    if (offline == m_internetOffline) {
+        return;
+    }
+    m_internetOffline = offline;
+    if (m_offlineBanner) {
+        m_offlineBanner->setVisible(offline);
+    }
+    const auto dialogs = findChildren<ScreenMonitorDialog *>();
+    for (ScreenMonitorDialog *dialog : dialogs) {
+        if (dialog) {
+            dialog->setInternetOffline(offline);
+        }
+    }
+    if (offline) {
+        appendLog(QStringLiteral("Not Connected to the Internet"), true);
+    }
+}
+
 void MainWindow::appendLog(const QString &message, bool highlight)
 {
     QTextCharFormat format;
@@ -192,6 +252,7 @@ void MainWindow::onServerLog(const QString &message, bool highlight)
 
 void MainWindow::onClientRegistered(const ClientInfo &info)
 {
+    m_busyIds.remove(info.id);
     // Drop any leftover rows for the same phone/device so the table never duplicates.
     for (int row = m_table->rowCount() - 1; row >= 0; --row) {
         const QTableWidgetItem *phoneItem = m_table->item(row, 0);
@@ -214,7 +275,14 @@ void MainWindow::onClientRegistered(const ClientInfo &info)
     if (row < 0) {
         row = findRowByPhone(info.phoneNumber);
     }
-    if (row < 0) {
+    const bool inserted = row < 0;
+    QString previousTime;
+    if (!inserted) {
+        if (const QTableWidgetItem *timeItem = m_table->item(row, 6)) {
+            previousTime = timeItem->text();
+        }
+    }
+    if (inserted) {
         row = m_table->rowCount();
         m_table->insertRow(row);
     }
@@ -243,16 +311,89 @@ void MainWindow::onClientRegistered(const ClientInfo &info)
     setCell(5, info.ipAddress);
     setCell(6, info.connectedAt);
     setStatusIcon(row, true);
+    // Newest connection time first. A row already in the list keeps its place
+    // until its time actually changes, so a refresh does not reshuffle ties.
+    if (inserted || previousTime != info.connectedAt) {
+        sortClientsNewestFirst();
+    }
     rebuildRowIndex();
+}
+
+void MainWindow::sortClientsNewestFirst()
+{
+    m_table->sortItems(6, Qt::DescendingOrder);
+    if (QHeaderView *header = m_table->horizontalHeader()) {
+        header->setSortIndicator(6, Qt::DescendingOrder);
+    }
+}
+
+void MainWindow::closeStreamingWindow(const QString &clientId)
+{
+    if (clientId.isEmpty()) {
+        return;
+    }
+    ScreenMonitorDialog *dialog = m_monitors.value(clientId);
+    if (!dialog) {
+        const auto dialogs = findChildren<ScreenMonitorDialog *>();
+        for (ScreenMonitorDialog *existing : dialogs) {
+            if (existing && existing->agentId() == clientId) {
+                dialog = existing;
+                break;
+            }
+        }
+    }
+    if (!dialog) {
+        return;
+    }
+    // Set before close(). destroyed() must not hand the phone back: that
+    // republish is what opened the streaming view again.
+    m_remoteEndedIds.insert(clientId);
+    dialog->abandon();
+    if (m_server) {
+        m_server->detachAgent(clientId);
+    }
 }
 
 void MainWindow::onClientDisconnected(const QString &clientId)
 {
+    closeStreamingWindow(clientId);
+    m_claimPending.remove(clientId);
+    const bool wasBusy = m_busyIds.remove(clientId);
     const int row = findRowByClientId(clientId);
     if (row < 0) {
         return;
     }
     setStatusIcon(row, false);
+    if (wasBusy) {
+        rebuildRowIndex();
+    }
+}
+
+void MainWindow::onClientRemoved(const QString &clientId)
+{
+    m_busyIds.remove(clientId);
+    m_monitoredIds.remove(clientId);
+    m_claimPending.remove(clientId);
+    closeStreamingWindow(clientId);
+    const int row = findRowByClientId(clientId);
+    if (row >= 0) {
+        m_table->removeRow(row);
+    }
+    rebuildRowIndex();
+}
+
+void MainWindow::onClientBusy(const QString &clientId)
+{
+    if (clientId.isEmpty() || m_busyIds.contains(clientId)) {
+        return;
+    }
+    // Joined after the preview opened: there is no row here to hide.
+    if (findRowByClientId(clientId) < 0) {
+        return;
+    }
+    m_busyIds.insert(clientId);
+    rebuildRowIndex();
+    appendLog(QStringLiteral("Mobile in use elsewhere: %1").arg(clientId));
 }
 
 void MainWindow::setStatusIcon(int row, bool online)
@@ -334,12 +475,13 @@ void MainWindow::rebuildRowIndex()
             continue;
         }
         const QString id = item->data(Qt::UserRole).toString();
-        // A mobile being previewed is driven from its own window, so it drops out
-        // of the list until that window closes. The row keeps its data and stays
+        // A mobile being previewed — here or by another operator — drops out of
+        // the list until that window closes. The row keeps its data and stays
         // indexed, so a re-registration while hidden still lands on it.
-        const bool monitored = !id.isEmpty() && m_monitoredIds.contains(id);
-        m_table->setRowHidden(row, monitored);
-        if (monitored) {
+        const bool hidden = !id.isEmpty()
+            && (m_monitoredIds.contains(id) || m_busyIds.contains(id));
+        m_table->setRowHidden(row, hidden);
+        if (hidden) {
             hidSelection = hidSelection || m_table->selectionModel()->isRowSelected(row);
         } else {
             // Number the rows on show, not on position, so hiding one does not
@@ -394,11 +536,82 @@ void MainWindow::openScreenMonitoring()
                                  QStringLiteral("That mobile is not available on the relay."));
         return;
     }
+    const auto open = findChildren<ScreenMonitorDialog *>();
+    for (ScreenMonitorDialog *existing : open) {
+        if (existing && existing->agentId() == id) {
+            existing->raise();
+            existing->activateWindow();
+            return;
+        }
+    }
+    if (m_claimPending.contains(id)) {
+        return;
+    }
+    // Ask first, open later. Only the relay knows whether another operator already
+    // took this mobile, so attaching before the answer would be the race that lets
+    // a second controller in.
+    m_claimPending.insert(id);
+    appendLog(QStringLiteral("Requesting control of %1").arg(id));
+    m_server->requestAgentClaim(id);
+}
+
+void MainWindow::onAgentClaimed(const QString &agentId, qint64 remainMs,
+                                const QString &controlKey)
+{
+    Q_UNUSED(controlKey)
+    if (!m_claimPending.remove(agentId)) {
+        return;
+    }
+    const qint64 minutes = remainMs > 0 ? (remainMs + 59'999) / 60'000 : 0;
+    appendLog(QStringLiteral("Control of %1 granted — %2 minutes left in this session")
+                  .arg(agentId)
+                  .arg(minutes),
+              true);
+    showMonitorFor(agentId, remainMs);
+}
+
+void MainWindow::onAgentClaimDenied(const QString &agentId, const QString &reason)
+{
+    const bool asked = m_claimPending.remove(agentId);
+    // A denial can also answer the re-claim sent after a relay reconnect, in which
+    // case a window is already open on a session we no longer own. Close it.
+    const auto dialogs = findChildren<ScreenMonitorDialog *>();
+    for (ScreenMonitorDialog *existing : dialogs) {
+        if (existing && existing->agentId() == agentId) {
+            existing->abandon();
+        }
+    }
+    QString text;
+    if (reason == QLatin1String("session_closed")) {
+        text = QStringLiteral("That mobile's one-hour sharing session has ended. The "
+                              "customer has to start sharing again before anyone can "
+                              "connect.");
+    } else if (reason == QLatin1String("in_use")) {
+        text = QStringLiteral("Another operator is already controlling that mobile.");
+    } else if (reason == QLatin1String("not_ready")) {
+        text = QStringLiteral("That mobile is not ready: its screen sharing or its "
+                              "accessibility service is not running. It comes back "
+                              "on the list by itself once the customer fixes it.");
+    } else {
+        text = QStringLiteral("The relay refused the connection to that mobile.");
+    }
+    appendLog(QStringLiteral("Control of %1 refused: %2").arg(agentId, text));
+    if (asked) {
+        QMessageBox::information(this, QStringLiteral("Screen monitoring"), text);
+    }
+}
+
+void MainWindow::showMonitorFor(const QString &id, qint64 remainMs)
+{
+    if (!m_server) {
+        return;
+    }
     ClientHandler *handler = m_server->handlerForId(id);
     if (!handler) {
         handler = m_server->attachAgent(id);
     }
     if (!handler) {
+        m_server->releaseAgentClaim(id);
         QMessageBox::warning(this, QStringLiteral("Screen monitoring"),
                              QStringLiteral("Failed to attach to the selected mobile."));
         return;
@@ -414,8 +627,19 @@ void MainWindow::openScreenMonitoring()
         }
     }
     auto *dialog = new ScreenMonitorDialog(handler, this);
+    dialog->setInternetOffline(m_internetOffline);
+    dialog->setSessionRemaining(remainMs);
+    m_monitors.insert(id, dialog);
+    dialog->shareGone = [this, id]() {
+        if (!m_server || m_endShareIds.contains(id) || m_remoteEndedIds.contains(id)
+                || m_hourEndedIds.contains(id)) {
+            return true;
+        }
+        return !m_server->isAgentOnline(id);
+    };
     dialog->reattachProvider = [this, id]() -> ClientHandler * {
-        if (!m_server) {
+        if (!m_server || m_endShareIds.contains(id) || m_remoteEndedIds.contains(id)
+                || m_hourEndedIds.contains(id)) {
             return nullptr;
         }
         if (ClientHandler *live = m_server->handlerForId(id)) {
@@ -431,8 +655,44 @@ void MainWindow::openScreenMonitoring()
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     // Track by id rather than by scanning for live dialogs: destroyed() fires once
     // the ScreenMonitorDialog part is already gone, so agentId() is unreachable.
+    connect(dialog, &ScreenMonitorDialog::sessionHourElapsed, this, [this](const QString &agentId) {
+        if (m_endShareIds.contains(agentId) || m_hourEndedIds.contains(agentId)) {
+            return;
+        }
+        m_hourEndedIds.insert(agentId);
+        if (m_server) {
+            m_server->expireAgentSession(agentId);
+        }
+    });
+    connect(dialog, &ScreenMonitorDialog::remoteStopped, this, [this](const QString &agentId) {
+        m_remoteEndedIds.insert(agentId);
+        if (m_server) {
+            m_server->detachAgent(agentId);
+        }
+    });
+    connect(dialog, &ScreenMonitorDialog::sharingStopRequested, this, [this](const QString &agentId) {
+        // Release now, not when the window's deleteLater runs. Until that
+        // happened a queued re-attach opened a fresh TCP socket and the preview
+        // flipped back to "TCP connected".
+        if (!m_endShareIds.contains(agentId)) {
+            m_endShareIds.insert(agentId);
+            if (m_server) {
+                m_server->releaseAgentClaim(agentId, true);
+                m_server->dropLocalEnded(agentId);
+            }
+        }
+    });
     connect(dialog, &QObject::destroyed, this, [this, id]() {
+        m_monitors.remove(id);
         m_monitoredIds.remove(id);
+        // Stop and the hour already told the relay what to do. Any other close
+        // hands the phone back so another operator can take it.
+        const bool hourEnded = m_hourEndedIds.remove(id);
+        const bool shareStopped = m_endShareIds.remove(id);
+        const bool remoteEnded = m_remoteEndedIds.remove(id);
+        if (m_server && !hourEnded && !shareStopped && !remoteEnded) {
+            m_server->releaseAgentClaim(id, false);
+        }
         rebuildRowIndex();
     });
     m_monitoredIds.insert(id);

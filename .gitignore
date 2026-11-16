@@ -45,6 +45,15 @@ logs/
 __pycache__/
 *.pyc
 
+# Packaged binaries (rebuild from source)
+EXE/
+Installers/
+Server/Controller/
+*.iss.bak
+
+# Payment / personal notes — never publish
+ReadMe.txt
+
 # IDE / OS
 .idea/
 .vs/
